@@ -189,16 +189,7 @@ interface DecodedImage {
   close: () => void;
 }
 
-function decodeImageBlob(blob: Blob): Promise<DecodedImage> {
-  if (typeof createImageBitmap === "function") {
-    return createImageBitmap(blob).then((bitmap) => ({
-      source: bitmap,
-      width: bitmap.width,
-      height: bitmap.height,
-      close: () => bitmap.close(),
-    }));
-  }
-
+function decodeImageBlobWithElement(blob: Blob): Promise<DecodedImage> {
   return new Promise((resolve, reject) => {
     const objectUrl = URL.createObjectURL(blob);
     const image = new Image();
@@ -215,6 +206,26 @@ function decodeImageBlob(blob: Blob): Promise<DecodedImage> {
     };
     image.src = objectUrl;
   });
+}
+
+async function decodeImageBlob(blob: Blob): Promise<DecodedImage> {
+  if (typeof createImageBitmap === "function") {
+    try {
+      const bitmap = await createImageBitmap(blob);
+      return {
+        source: bitmap,
+        width: bitmap.width,
+        height: bitmap.height,
+        close: () => bitmap.close(),
+      };
+    } catch {
+      // WebKit has shipped createImageBitmap implementations that reject image
+      // formats its HTMLImageElement decoder can still display. Falling back
+      // also keeps undo and remix loads usable on those releases.
+    }
+  }
+
+  return decodeImageBlobWithElement(blob);
 }
 
 async function decodeValidatedImage(validated: ValidatedImage) {
@@ -261,8 +272,45 @@ function getHistoryByteLimit() {
 }
 
 function snapshotCanvasLayer(canvas: HTMLCanvasElement) {
-  const encoded = canvas.toDataURL("image/webp", HISTORY_WEBP_QUALITY);
+  let encoded = canvas.toDataURL("image/webp", HISTORY_WEBP_QUALITY);
+  if (!/^data:image\/(?:png|jpeg|webp);base64,/i.test(encoded)) {
+    encoded = canvas.toDataURL("image/png");
+  }
   return dataUrlToBlob(encoded, DESKTOP_HISTORY_BYTES);
+}
+
+async function encodeCanvasWithFallback(
+  canvas: HTMLCanvasElement,
+  preferredType: DrawingImageType,
+  quality?: number,
+) {
+  const fallbackTypes: DrawingImageType[] = [
+    preferredType,
+    ...(preferredType === "image/jpeg" ? [] : ["image/jpeg" as const]),
+    ...(preferredType === "image/png" ? [] : ["image/png" as const]),
+  ];
+  let lastError: unknown;
+
+  for (const type of fallbackTypes) {
+    try {
+      const blob = await canvasToBlob(canvas, type, quality);
+      if (
+        blob.size > 0 &&
+        (blob.type === "image/png" ||
+          blob.type === "image/jpeg" ||
+          blob.type === "image/webp")
+      ) {
+        return blob;
+      }
+      lastError = new Error("The browser returned an unsupported drawing format.");
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("The browser could not encode the drawing.");
 }
 
 function createCompositeCanvas(
@@ -486,6 +534,7 @@ export const DrawingCanvas = forwardRef<
   const historyIndexRef = useRef(-1);
   const restoreGenerationRef = useRef(0);
   const loadGenerationRef = useRef(0);
+  const changeGenerationRef = useRef(0);
   const onChangeRef = useRef(onChange);
   const onExportRef = useRef(onExport);
   const textDraftRef = useRef<TextDraft | null>(null);
@@ -527,18 +576,59 @@ export const DrawingCanvas = forwardRef<
       const canvas = canvasRef.current;
       if (!canvas) return "";
 
-      const exportCanvas = document.createElement("canvas");
-      exportCanvas.width = canvas.width;
-      exportCanvas.height = canvas.height;
-      const context = exportCanvas.getContext("2d");
-      if (!context) return "";
-
-      context.fillStyle = backgroundOverride ?? backgroundRef.current;
-      context.fillRect(0, 0, exportCanvas.width, exportCanvas.height);
-      context.drawImage(canvas, 0, 0);
-      return exportCanvas.toDataURL(type, quality);
+      try {
+        const exportCanvas = createCompositeCanvas(
+          canvas,
+          backgroundOverride ?? backgroundRef.current,
+        );
+        const encoded = exportCanvas.toDataURL(type, quality);
+        if (/^data:image\/(?:png|jpeg|webp);base64,/i.test(encoded)) {
+          return encoded;
+        }
+        return exportCanvas.toDataURL("image/png");
+      } catch {
+        return "";
+      }
     },
     [],
+  );
+
+  const emitChangeDataUrl = useCallback(
+    (nextBackground: string) => {
+      if (!onChangeRef.current) return;
+      const generation = ++changeGenerationRef.current;
+
+      // Keep pointer-up responsive. History already performs one synchronous
+      // layer snapshot, so the composited callback image is encoded off the
+      // event stack and stale results are discarded.
+      void Promise.resolve().then(async () => {
+        if (generation !== changeGenerationRef.current) return;
+        const layer = canvasRef.current;
+        if (!layer) return;
+
+        try {
+          const composite = createCompositeCanvas(layer, nextBackground);
+          const blob = await encodeCanvasWithFallback(
+            composite,
+            "image/webp",
+            CHANGE_WEBP_QUALITY,
+          );
+          const dataUrl = await blobToDataUrl(blob);
+          if (generation === changeGenerationRef.current) {
+            onChangeRef.current?.(dataUrl);
+          }
+        } catch {
+          if (generation !== changeGenerationRef.current) return;
+          const fallback = exportDataUrl(
+            "image/png",
+            undefined,
+            nextBackground,
+          );
+          if (fallback) onChangeRef.current?.(fallback);
+        }
+      });
+    },
+    [exportDataUrl],
   );
 
   const exportCompressed = useCallback(
@@ -564,13 +654,21 @@ export const DrawingCanvas = forwardRef<
         options.maxDimension,
       );
       let quality = initialQuality;
-      let blob = await canvasToBlob(workingCanvas, requestedType, quality);
+      let blob = await encodeCanvasWithFallback(
+        workingCanvas,
+        requestedType,
+        quality,
+      );
       let actualType = blob.type as DrawingImageType;
 
       // Some older browsers silently return PNG when WebP is requested. PNG has
       // no useful quality control, so JPEG is the predictable compressed fallback.
       if (actualType !== requestedType) {
-        blob = await canvasToBlob(workingCanvas, "image/jpeg", quality);
+        blob = await encodeCanvasWithFallback(
+          workingCanvas,
+          "image/jpeg",
+          quality,
+        );
         actualType = blob.type as DrawingImageType;
       }
 
@@ -583,7 +681,7 @@ export const DrawingCanvas = forwardRef<
         let bestWithinQuality = minQuality;
         for (let attempt = 0; attempt < 6; attempt += 1) {
           quality = attempt === 0 ? minQuality : (low + high) / 2;
-          const candidate = await canvasToBlob(
+          const candidate = await encodeCanvasWithFallback(
             workingCanvas,
             actualType === "image/webp" ? "image/webp" : "image/jpeg",
             quality,
@@ -626,7 +724,7 @@ export const DrawingCanvas = forwardRef<
           context.drawImage(workingCanvas, 0, 0, next.width, next.height);
           workingCanvas = next;
           quality = minQuality;
-          blob = await canvasToBlob(
+          blob = await encodeCanvasWithFallback(
             workingCanvas,
             actualType === "image/webp" ? "image/webp" : "image/jpeg",
             quality,
@@ -653,6 +751,10 @@ export const DrawingCanvas = forwardRef<
     (nextBackground = backgroundRef.current, emitChange = true) => {
       const canvas = canvasRef.current;
       if (!canvas) return;
+
+      // A new local edit wins over an older asynchronous restore/import.
+      ++restoreGenerationRef.current;
+      ++loadGenerationRef.current;
 
       const entry: HistoryEntry = {
         contentBlob: snapshotCanvasLayer(canvas),
@@ -685,12 +787,10 @@ export const DrawingCanvas = forwardRef<
       });
 
       if (emitChange) {
-        onChangeRef.current?.(
-          exportDataUrl("image/webp", CHANGE_WEBP_QUALITY, nextBackground),
-        );
+        emitChangeDataUrl(nextBackground);
       }
     },
-    [exportDataUrl, maxHistory],
+    [emitChangeDataUrl, maxHistory],
   );
 
   const restoreHistory = useCallback(
@@ -700,41 +800,54 @@ export const DrawingCanvas = forwardRef<
       if (!entry || !canvas) return;
 
       const generation = ++restoreGenerationRef.current;
-      historyIndexRef.current = nextIndex;
-      setHistoryState({ index: nextIndex, length: historyRef.current.length });
-      backgroundRef.current = entry.backgroundColor;
-      setBackgroundColor(entry.backgroundColor);
-
-      const context = getContext(canvas);
-      context?.clearRect(0, 0, canvas.width, canvas.height);
-
       void decodeImageBlob(entry.contentBlob)
         .then((image) => {
-          if (generation !== restoreGenerationRef.current) {
+          try {
+            if (generation !== restoreGenerationRef.current) return;
+            const currentCanvas = canvasRef.current;
+            if (!currentCanvas) return;
+            const currentContext = getContext(currentCanvas);
+            if (!currentContext) {
+              throw new Error("The drawing context is unavailable.");
+            }
+
+            // Do not clear the visible layer until the snapshot has decoded.
+            // A failed WebP/createImageBitmap decode must leave the user's
+            // current drawing intact.
+            const restoredLayer = document.createElement("canvas");
+            restoredLayer.width = currentCanvas.width;
+            restoredLayer.height = currentCanvas.height;
+            const restoredContext = restoredLayer.getContext("2d");
+            if (!restoredContext) {
+              throw new Error("The restored drawing context is unavailable.");
+            }
+            restoredContext.drawImage(image.source, 0, 0);
+
+            currentContext.save();
+            try {
+              currentContext.globalCompositeOperation = "source-over";
+              currentContext.clearRect(
+                0,
+                0,
+                currentCanvas.width,
+                currentCanvas.height,
+              );
+              currentContext.drawImage(restoredLayer, 0, 0);
+            } finally {
+              currentContext.restore();
+            }
+
+            historyIndexRef.current = nextIndex;
+            setHistoryState({
+              index: nextIndex,
+              length: historyRef.current.length,
+            });
+            backgroundRef.current = entry.backgroundColor;
+            setBackgroundColor(entry.backgroundColor);
+            emitChangeDataUrl(entry.backgroundColor);
+          } finally {
             image.close();
-            return;
           }
-          const currentCanvas = canvasRef.current;
-          if (!currentCanvas) {
-            image.close();
-            return;
-          }
-          const currentContext = getContext(currentCanvas);
-          currentContext?.clearRect(
-            0,
-            0,
-            currentCanvas.width,
-            currentCanvas.height,
-          );
-          currentContext?.drawImage(image.source, 0, 0);
-          image.close();
-          onChangeRef.current?.(
-            exportDataUrl(
-              "image/webp",
-              CHANGE_WEBP_QUALITY,
-              entry.backgroundColor,
-            ),
-          );
         })
         .catch(() => {
           if (generation === restoreGenerationRef.current) {
@@ -742,7 +855,7 @@ export const DrawingCanvas = forwardRef<
           }
         });
     },
-    [exportDataUrl],
+    [emitChangeDataUrl],
   );
 
   const undo = useCallback(() => {
@@ -808,14 +921,11 @@ export const DrawingCanvas = forwardRef<
   const saveDraft = useCallback(async (): Promise<DrawingCanvasDraft> => {
     const canvas = canvasRef.current;
     if (!canvas) throw new Error("The drawing canvas is not ready.");
-    let blob = await canvasToBlob(
+    const blob = await encodeCanvasWithFallback(
       canvas,
       "image/webp",
       DRAFT_WEBP_QUALITY,
     );
-    if (blob.type !== "image/webp") {
-      blob = await canvasToBlob(canvas, "image/png");
-    }
     return {
       version: 1,
       width: canvas.width,
@@ -936,6 +1046,17 @@ export const DrawingCanvas = forwardRef<
       undo,
     ],
   );
+
+  useEffect(() => {
+    const changeGeneration = changeGenerationRef;
+    const restoreGeneration = restoreGenerationRef;
+    const loadGeneration = loadGenerationRef;
+    return () => {
+      ++changeGeneration.current;
+      ++restoreGeneration.current;
+      ++loadGeneration.current;
+    };
+  }, []);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -1073,7 +1194,12 @@ export const DrawingCanvas = forwardRef<
 
   const handlePointerDown = useCallback(
     (event: ReactPointerEvent<HTMLCanvasElement>) => {
-      if (disabled || (event.pointerType === "mouse" && event.button !== 0)) {
+      if (
+        disabled ||
+        !event.isPrimary ||
+        gestureRef.current !== null ||
+        (event.pointerType === "mouse" && event.button !== 0)
+      ) {
         return;
       }
 
@@ -1637,6 +1763,7 @@ export const DrawingCanvas = forwardRef<
             onPointerMove={handlePointerMove}
             onPointerUp={(event) => finishGesture(event)}
             onPointerCancel={(event) => finishGesture(event, true)}
+            onLostPointerCapture={(event) => finishGesture(event, true)}
             onContextMenu={(event) => event.preventDefault()}
             style={{
               display: "block",
@@ -1665,7 +1792,10 @@ export const DrawingCanvas = forwardRef<
                 top: `${textDraft.y * zoom}px`,
                 maxWidth: `${Math.max(120, (width - textDraft.x) * zoom)}px`,
                 color: textDraft.color,
-                fontSize: `${textDraft.fontSize * zoom}px`,
+                // Mobile browsers zoom the whole page when a focused input is
+                // rendered below 16 CSS pixels. Keep the editor readable; the
+                // committed canvas text still uses the selected logical size.
+                fontSize: `${Math.max(16, textDraft.fontSize * zoom)}px`,
               }}
               onChange={(event) => {
                 const nextDraft = { ...textDraft, value: event.target.value };

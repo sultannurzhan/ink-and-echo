@@ -156,6 +156,49 @@ test("deadline and destructive reset guards are wired into room actions", async 
   assert.match(resetBranch, /fail\s*\(/);
 });
 
+test("an expired drawing is recorded as a timeout, never as an opaque image", async () => {
+  const service = await projectFile("lib/server/room-service.ts");
+  const expiryStart = service.indexOf("async function expireCurrentTurn");
+  const resetStart = service.indexOf("async function resetRoom", expiryStart);
+  assert.ok(expiryStart >= 0 && resetStart > expiryStart, "expected the turn expiry branch");
+  const expiryBranch = service.slice(expiryStart, resetStart);
+
+  assert.doesNotMatch(expiryBranch, /data:image\//);
+  assert.match(expiryBranch, /else if \(isDrawingTurn\(turn\.kind\)\)[\s\S]{0,300}?imageData = null/);
+  assert.match(expiryBranch, /expired:\s*true/);
+  assert.match(service, /sourceExpired/);
+  assert.match(
+    service,
+    /imageData:\s*metadata\.expired\s*===\s*true\s*\?\s*null\s*:\s*row\.image_data/,
+    "legacy timeout placeholders already stored in production must also be hidden",
+  );
+});
+
+test("mobile drawing deadlines submit the canvas and never manufacture a black fallback", async () => {
+  const [gameApp, canvas] = await Promise.all([
+    projectFile("components/GameApp.tsx"),
+    projectFile("components/DrawingCanvas.tsx"),
+  ]);
+
+  assert.match(gameApp, /expiredTurnSignature\s*===\s*turnSignature/);
+  assert.match(gameApp, /type:\s*["']image\/jpeg["']/);
+  assert.doesNotMatch(gameApp, /onAction\(["']expire_turn["']/);
+  assert.match(gameApp, /gallery-timeout/);
+  assert.match(canvas, /createImageBitmap[\s\S]{0,500}?catch/);
+  assert.match(canvas, /event\.isPrimary/);
+});
+
+test("heartbeats do not force full image snapshots while presence stays online", async () => {
+  const service = await projectFile("lib/server/room-service.ts");
+  const start = service.indexOf("function presenceVersionFor");
+  const end = service.indexOf("function entryFromRow", start);
+  assert.ok(start >= 0 && end > start, "expected the presence version helper");
+  const presenceVersion = service.slice(start, end);
+
+  assert.match(presenceVersion, /last_seen_at\s*>=\s*now\s*-\s*ONLINE_WINDOW_MS/);
+  assert.doesNotMatch(presenceVersion, /\$\{player\.last_seen_at\}/);
+});
+
 test("leave is replay-safe and gates seat release on the expected room version", async () => {
   const service = await projectFile("lib/server/room-service.ts");
   const leaveStart = service.indexOf("export async function leaveRoom");

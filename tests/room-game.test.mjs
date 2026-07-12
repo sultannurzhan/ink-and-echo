@@ -10,7 +10,9 @@ import {
 } from "../lib/server/room-game.ts";
 import {
   DEADLINE_GRACE_MS,
+  DRAWING_SUBMISSION_GRACE_MS,
   isTurnExpired,
+  turnDeadlineGraceMs,
 } from "../lib/server/room-deadline.ts";
 
 const players = [
@@ -195,5 +197,52 @@ test("the authoritative deadline guard allows its grace window and rejects late 
   assert.equal(
     isTurnExpired({ ...state, currentTurn: null }, deadline + 1_000_000),
     false,
+  );
+});
+
+test("every drawing mode gets upload grace without extending its visible timer", () => {
+  const classicSettings = settings("classic-chain");
+  const prompt = initialGameState(classicSettings, "player-a", 100_000);
+  assert.equal(turnDeadlineGraceMs(classicSettings, prompt), DEADLINE_GRACE_MS);
+
+  const drawing = submitText(
+    classicSettings,
+    prompt,
+    "player-a",
+    101_000,
+    "upload-grace",
+  ).state;
+  const drawingDeadline = drawing.currentTurn.deadlineAt;
+  assert.equal(
+    turnDeadlineGraceMs(classicSettings, drawing),
+    DRAWING_SUBMISSION_GRACE_MS,
+  );
+  assert.equal(
+    isTurnExpired(drawing, drawingDeadline + DEADLINE_GRACE_MS + 1, turnDeadlineGraceMs(classicSettings, drawing)),
+    false,
+  );
+  assert.equal(
+    isTurnExpired(drawing, drawingDeadline + DRAWING_SUBMISSION_GRACE_MS + 1, turnDeadlineGraceMs(classicSettings, drawing)),
+    true,
+  );
+
+  const speedSettings = settings("speed-chaos", { timerSeconds: 25 });
+  const speedDrawing = initialGameState(speedSettings, "player-a", 200_000);
+  assert.equal(turnDeadlineGraceMs(speedSettings, speedDrawing), DRAWING_SUBMISSION_GRACE_MS);
+  assert.equal(
+    isTurnExpired(
+      speedDrawing,
+      speedDrawing.currentTurn.deadlineAt + DEADLINE_GRACE_MS + 1,
+      turnDeadlineGraceMs(speedSettings, speedDrawing),
+    ),
+    false,
+  );
+  assert.equal(
+    isTurnExpired(
+      speedDrawing,
+      speedDrawing.currentTurn.deadlineAt + DRAWING_SUBMISSION_GRACE_MS + 1,
+      turnDeadlineGraceMs(speedSettings, speedDrawing),
+    ),
+    true,
   );
 });

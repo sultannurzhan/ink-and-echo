@@ -5,7 +5,7 @@ import {
   validateImageDataUrl,
 } from "./image-data-url";
 import { roomDatabase } from "./room-db";
-import { isTurnExpired } from "./room-deadline";
+import { isTurnExpired, turnDeadlineGraceMs } from "./room-deadline";
 import {
   addBlindClue,
   advanceAfterDrawing,
@@ -30,9 +30,6 @@ const PRESENCE_WRITE_INTERVAL_MS = 10_000;
 const WAITING_RETENTION_MS = 24 * 60 * 60 * 1_000;
 const PLAYING_RETENTION_MS = 48 * 60 * 60 * 1_000;
 const FINISHED_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
-const TRANSPARENT_PIXEL =
-  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
-
 interface RoomRow {
   code: string;
   host_player_id: string;
@@ -424,7 +421,10 @@ function publicPlayer(player: PlayerRow, hostPlayerId: string, now = Date.now())
 function presenceVersionFor(players: PlayerRow[], now: number): number {
   let hash = 2166136261;
   for (const player of players) {
-    const value = `${player.id}:${player.last_seen_at}:${player.last_seen_at >= now - ONLINE_WINDOW_MS ? 1 : 0};`;
+    // Presence should change only when a seat crosses online/offline, not on every
+    // heartbeat. Hashing exact timestamps caused full image snapshots to be sent
+    // repeatedly during otherwise unchanged drawing turns.
+    const value = `${player.id}:${player.last_seen_at >= now - ONLINE_WINDOW_MS ? 1 : 0};`;
     for (let index = 0; index < value.length; index += 1) {
       hash ^= value.charCodeAt(index);
       hash = Math.imul(hash, 16777619);
@@ -434,6 +434,7 @@ function presenceVersionFor(players: PlayerRow[], now: number): number {
 }
 
 function entryFromRow(row: EntryRow, players: PlayerRow[]) {
+  const metadata = parseJson<Record<string, unknown>>(row.metadata_json, {});
   return {
     id: row.id,
     ordinal: row.ordinal,
@@ -442,8 +443,11 @@ function entryFromRow(row: EntryRow, players: PlayerRow[]) {
     authorName: players.find((player) => player.id === row.author_player_id)?.name ?? "Player",
     kind: row.kind,
     text: row.text_content,
-    imageData: row.image_data,
-    metadata: parseJson<Record<string, unknown>>(row.metadata_json, {}),
+    // Older releases stored an opaque-black placeholder for expired drawing
+    // turns. Never expose any timeout row as a real drawing, including history
+    // that already exists in production.
+    imageData: metadata.expired === true ? null : row.image_data,
+    metadata,
     createdAt: row.created_at,
   };
 }
@@ -456,6 +460,7 @@ function hiddenEntry(entry: ReturnType<typeof entryFromRow>) {
     authorPlayerId: entry.authorPlayerId,
     authorName: entry.authorName,
     kind: entry.kind,
+    expired: entry.metadata.expired === true,
     hidden: true,
   };
 }
@@ -498,6 +503,12 @@ function publicTurn(
           ? "draw"
           : turn.kind;
   const visibleSource = source && !("hidden" in source) ? source : null;
+  const actorSource = viewerPlayerId === internalTurn.actorPlayerId ? visibleSource : null;
+  const sourceExpired = source
+    ? "hidden" in source
+      ? source.expired === true
+      : source.metadata.expired === true
+    : false;
 
   return {
     ...turn,
@@ -507,7 +518,7 @@ function publicTurn(
     prompt:
       viewerPlayerId === turn.actorPlayerId && turn.suggestedPrompt
         ? turn.suggestedPrompt
-        : visibleSource?.text ?? undefined,
+        : actorSource?.text ?? undefined,
     clue: turn.clues?.at(-1),
     canAddClue:
       internalTurn.kind === "blind-drawing" &&
@@ -517,8 +528,9 @@ function publicTurn(
       state.round > 0 && state.round % 4 === 0
         ? DUO_BEATS[(state.round / 4 - 1) % DUO_BEATS.length]
         : undefined,
-    previousText: visibleSource?.text ?? undefined,
-    previousImage: visibleSource?.imageData ?? undefined,
+    previousText: actorSource?.text ?? undefined,
+    previousImage: actorSource?.imageData ?? undefined,
+    sourceExpired,
   };
 }
 
@@ -640,7 +652,10 @@ export async function getRoomSnapshot(
   const settings = parsePersistedObject<RoomSettings>(room.settings_json, "room settings");
   const state = parsePersistedObject<StoredGameState>(room.game_state_json, "game state");
 
-  if (room.status === "playing" && isTurnExpired(state, Date.now())) {
+  if (
+    room.status === "playing" &&
+    isTurnExpired(state, Date.now(), turnDeadlineGraceMs(settings, state))
+  ) {
     try {
       await expireCurrentTurn({
         database,
@@ -1185,11 +1200,13 @@ async function expireCurrentTurn(args: {
   const { database, room, players, settings, state, now, force = false } = args;
   const turn = state.currentTurn;
   if (room.status !== "playing" || !turn) return false;
-  if (!force && !isTurnExpired(state, now)) return false;
-  if (force && now < turn.deadlineAt) {
+  const graceMs = turnDeadlineGraceMs(settings, state);
+  if (!isTurnExpired(state, now, graceMs)) {
+    if (!force) return false;
     fail(409, "turn_not_expired", "This turn still has time remaining.", {
       serverNow: now,
       deadlineAt: turn.deadlineAt,
+      expiresAt: turn.deadlineAt + graceMs,
     });
   }
 
@@ -1217,7 +1234,9 @@ async function expireCurrentTurn(args: {
     });
     entryKind = textKind;
   } else if (isDrawingTurn(turn.kind)) {
-    imageData = TRANSPARENT_PIXEL;
+    // A timeout is an event, not a drawing. The former one-pixel placeholder
+    // was opaque black and was enlarged as if a player had submitted it.
+    imageData = null;
     advanced = advanceAfterDrawing({
       settings,
       state,
@@ -1324,7 +1343,10 @@ export async function performRoomAction(
     };
   }
 
-  if (room.status === "playing" && isTurnExpired(state, now)) {
+  if (
+    room.status === "playing" &&
+    isTurnExpired(state, now, turnDeadlineGraceMs(settings, state))
+  ) {
     try {
       await expireCurrentTurn({ database, room, players, settings, state, now });
     } catch (error) {

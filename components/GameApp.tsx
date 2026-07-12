@@ -66,6 +66,10 @@ type GalleryEntry = {
   text?: string;
   imageData?: string;
   rule?: string;
+  metadata?: {
+    expired?: boolean;
+    [key: string]: unknown;
+  };
 };
 type CurrentTurn = {
   kind: "prompt" | "guess" | "caption" | "draw" | "memory" | "remix" | "blind-draw";
@@ -81,6 +85,7 @@ type CurrentTurn = {
   deadlineAt?: number;
   revealUntil?: number;
   sourceEntryId?: string | null;
+  sourceExpired?: boolean;
   canAddClue?: boolean;
 };
 type Room = {
@@ -206,8 +211,6 @@ const DEMO_REMIX_RULES = [
   "Add something suspicious",
   "Make it unexpectedly fancy",
 ];
-
-const DEMO_EMPTY_DRAWING = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAF/gL+Avz6WQAAAABJRU5ErkJggg==";
 
 function normalizeRoom(value: unknown): Room {
   const body = value as { room?: Room } & Room;
@@ -690,6 +693,9 @@ export function GameApp() {
       wakePollRef.current?.();
       if (cause instanceof RoomApiError && cause.status === 409) {
         setError("That turn already moved on. We’re loading the newest version now.");
+      } else if (cause instanceof RoomApiError && cause.status >= 400 && cause.status < 500) {
+        setReconnecting(false);
+        setError(cause.message);
       } else {
         setReconnecting(true);
         setError("We could not confirm whether that turn arrived. Your draft is still saved while we check.");
@@ -1247,7 +1253,8 @@ function GameStage({ session, loading, onAction, onLocalRoom, onGallery }: {
   const isMyTurn = room.code === "DEMO" || !active || active === playerId;
   const currentPlayer = room.players.find((player) => player.id === active);
   const mode = modeById(room.settings.mode);
-  const [timerExpired, setTimerExpired] = useState(false);
+  const turnSignature = roomTurnSignature(room);
+  const [expiredTurnSignature, setExpiredTurnSignature] = useState("");
   const [customClue, setCustomClue] = useState("");
 
   return (
@@ -1261,12 +1268,12 @@ function GameStage({ session, loading, onAction, onLocalRoom, onGallery }: {
           deadlineAt={room.currentTurn?.deadlineAt}
           serverNow={room.serverNow}
           onExpire={() => {
-            if (isMyTurn) setTimerExpired(true);
+            if (isMyTurn) setExpiredTurnSignature(turnSignature);
           }}
         />
       </div>
       {isMyTurn ? (
-        <TurnWorkspace key={`${room.turnIndex}-${active}-${room.currentTurn?.kind}`} room={room} playerId={playerId} loading={loading} timerExpired={timerExpired} onAction={onAction} onLocalRoom={onLocalRoom} onGallery={onGallery} />
+        <TurnWorkspace key={`${room.turnIndex}-${active}-${room.currentTurn?.kind}`} room={room} playerId={playerId} loading={loading} timerExpired={expiredTurnSignature === turnSignature} onAction={onAction} onLocalRoom={onLocalRoom} onGallery={onGallery} />
       ) : (
         <div className="partner-wait paper-card-static">
           <div className="thinking-doodle" aria-hidden="true"><i /><i /><i /></div>
@@ -1361,6 +1368,10 @@ function TurnWorkspace({ room, playerId, loading, timerExpired, onAction, onLoca
   const draftSaveTimerRef = useRef<number | undefined>(undefined);
   const [draftReady, setDraftReady] = useState(false);
   const [draftNote, setDraftNote] = useState("");
+  const [preparingDrawing, setPreparingDrawing] = useState(false);
+  const submitInFlightRef = useRef(false);
+  const submitTextRef = useRef<() => Promise<void>>(async () => undefined);
+  const submitDrawingRef = useRef<() => Promise<void>>(async () => undefined);
   const isDrawing = ["draw", "memory", "remix", "blind-draw"].includes(turn.kind);
   const draftKey = turnDraftKey(room.code, playerId, roomTurnSignature(room));
   const clockOffsetRef = useRef(0);
@@ -1516,37 +1527,56 @@ function TurnWorkspace({ room, playerId, loading, timerExpired, onAction, onLoca
   }
 
   async function submitDrawing() {
+    if (submitInFlightRef.current) return;
+    submitInFlightRef.current = true;
+    setPreparingDrawing(true);
     setDraftNote("Preparing a lightweight copy…");
-    const exported = await canvasRef.current?.exportCompressed({
-      type: "image/webp",
-      quality: 0.86,
-      minQuality: 0.5,
-      // Base64 adds roughly one third; this stays below the server's 1.5M-character data-URL cap.
-      maxBytes: 1_100_000,
-      maxDimension: 1080,
-      allowResize: true,
-    });
-    if (exported && !exported.withinLimit) {
-      setDraftNote("This drawing is still too large to send. Try clearing a photo-like background or simplifying the canvas.");
-      return;
-    }
-    const imageData = exported?.dataUrl || latestDrawingRef.current;
-    if (!imageData) return;
-    if (room.code === "DEMO") {
-      advanceDemo({
-        round: turn.round,
-        kind: turn.kind,
-        playerId: room.activePlayerId ?? playerId,
-        playerName: room.players.find((player) => player.id === room.activePlayerId)?.name,
-        imageData,
-        rule: turn.rule,
+    try {
+      // JPEG is broadly and consistently decoded by mobile Chrome and keeps the paper color opaque.
+      const exported = await canvasRef.current?.exportCompressed({
+        type: "image/jpeg",
+        quality: 0.9,
+        minQuality: 0.55,
+        // Base64 adds roughly one third; this stays below the server's 1.5M-character data-URL cap.
+        maxBytes: 1_100_000,
+        maxDimension: 1080,
+        allowResize: true,
       });
-      await deleteTurnDraft(draftKey);
-    } else {
-      const sent = await onAction("submit_drawing", { imageData, kind: turn.kind, rule: turn.rule });
-      if (sent) await deleteTurnDraft(draftKey);
+      if (exported && !exported.withinLimit) {
+        setDraftNote("This drawing is still too large to send. Try clearing a photo-like background or simplifying the canvas.");
+        return;
+      }
+      const imageData = exported?.dataUrl || latestDrawingRef.current;
+      if (!imageData) {
+        setDraftNote("The canvas could not be prepared. Your draft is still saved—please try Send again.");
+        return;
+      }
+      if (room.code === "DEMO") {
+        advanceDemo({
+          round: turn.round,
+          kind: turn.kind,
+          playerId: room.activePlayerId ?? playerId,
+          playerName: room.players.find((player) => player.id === room.activePlayerId)?.name,
+          imageData,
+          rule: turn.rule,
+        });
+        await deleteTurnDraft(draftKey);
+      } else {
+        const sent = await onAction("submit_drawing", { imageData, kind: turn.kind, rule: turn.rule });
+        if (sent) await deleteTurnDraft(draftKey);
+      }
+    } catch {
+      setDraftNote("We could not prepare this copy. Your drawing is still here and saved locally—please try again.");
+    } finally {
+      submitInFlightRef.current = false;
+      setPreparingDrawing(false);
     }
   }
+
+  useEffect(() => {
+    submitTextRef.current = submitText;
+    submitDrawingRef.current = submitDrawing;
+  });
 
   useEffect(() => {
     if (
@@ -1557,31 +1587,24 @@ function TurnWorkspace({ room, playerId, loading, timerExpired, onAction, onLoca
     }
     autoSubmittedRef.current = true;
     const autoSubmit = window.setTimeout(() => {
-      if (room.code === "DEMO") {
-        if (room.settings.mode !== "speed-chaos") return;
-        if (isDrawing) {
-          advanceDemo({
-            round: turn.round,
-            kind: turn.kind,
-            playerId,
-            playerName: room.players.find((player) => player.id === room.activePlayerId)?.name,
-            imageData: latestDrawingRef.current || DEMO_EMPTY_DRAWING,
-          });
-        } else {
-          advanceDemo({
-            round: turn.round,
-            kind: turn.kind,
-            playerId,
-            playerName: room.players.find((player) => player.id === room.activePlayerId)?.name,
-            text: text.trim() || "A very fast mystery!",
-          });
-        }
+      if (isDrawing) {
+        void submitDrawingRef.current();
         return;
       }
-      void onAction("expire_turn", {});
+      if (text.trim()) {
+        void submitTextRef.current();
+      } else if (room.code === "DEMO") {
+        advanceDemo({
+          round: turn.round,
+          kind: turn.kind,
+          playerId,
+          playerName: room.players.find((player) => player.id === room.activePlayerId)?.name,
+          text: "A very fast mystery!",
+        });
+      }
     }, 0);
     return () => window.clearTimeout(autoSubmit);
-  }, [advanceDemo, isDrawing, onAction, playerId, room.activePlayerId, room.code, room.players, room.settings.mode, text, timerExpired, turn.kind, turn.round]);
+  }, [advanceDemo, isDrawing, playerId, room.activePlayerId, room.code, room.players, text, timerExpired, turn.kind, turn.round]);
 
   if (isDrawing) {
     if (memoryVisible && turn.previousImage) {
@@ -1616,7 +1639,7 @@ function TurnWorkspace({ room, playerId, loading, timerExpired, onAction, onLoca
             latestDrawingRef.current = dataUrl;
             saveDrawingDraftSoon();
           }}
-          disabled={loading}
+          disabled={loading || preparingDrawing}
           downloadFileName={`ink-and-echo-round-${turn.round}.png`}
           ariaLabel={`Drawing canvas for round ${turn.round}`}
         />
@@ -1638,7 +1661,7 @@ function TurnWorkspace({ room, playerId, loading, timerExpired, onAction, onLoca
               void onAction("add_clue", {});
             }}>One more clue</button>
           )}
-          <button className="primary-button" onClick={submitDrawing} disabled={loading}>{loading ? "Passing the sketch…" : "Send this masterpiece →"}</button>
+          <button className="primary-button" onClick={submitDrawing} disabled={loading || preparingDrawing}>{loading ? "Passing the sketch…" : preparingDrawing ? "Preparing the sketch…" : "Send this masterpiece →"}</button>
         </div>
       </div>
     );
@@ -1669,6 +1692,7 @@ function TurnBrief({ turn }: { turn: CurrentTurn }) {
       <div><span className="mini-label">Your turn</span><h1>{turn.instruction ?? "Add the next little twist."}</h1></div>
       {(turn.rule || turn.clue) && <div className="rule-card"><small>{turn.rule ? "Remix rule" : "Clue unlocked"}</small><strong>{turn.rule ?? turn.clue}</strong></div>}
       {turn.duoBeat && <div className="duo-beat-card"><span>♥</span><div><small>Duo beat · optional</small><strong>{turn.duoBeat}</strong></div></div>}
+      {turn.sourceExpired && <div className="expired-source-note" role="status"><span>⌛</span><div><small>The previous turn timed out</small><strong>No drawing arrived, so continue with your funniest interpretation.</strong></div></div>}
       {(turn.prompt || turn.previousText) && <blockquote><small>What you know</small><p>{turn.prompt ?? turn.previousText}</p></blockquote>}
     </div>
   );
@@ -1681,7 +1705,9 @@ function Gallery({ room, onAgain, onDelete, loading }: { room: Room; onAgain: ()
     if (!entry.imageData) return;
     const link = document.createElement("a");
     link.href = entry.imageData;
-    link.download = `ink-and-echo-round-${index + 1}.png`;
+    const mime = entry.imageData.match(/^data:image\/(png|jpeg|webp);/i)?.[1]?.toLowerCase();
+    const extension = mime === "jpeg" ? "jpg" : mime === "webp" ? "webp" : "png";
+    link.download = `ink-and-echo-round-${index + 1}.${extension}`;
     link.click();
   }
   function exportStory() {
@@ -1702,9 +1728,13 @@ function Gallery({ room, onAgain, onDelete, loading }: { room: Room; onAgain: ()
       </div>
       <div className="gallery-chain">
         {entries.map((entry, index) => (
-          <article className={`gallery-entry ${entry.imageData ? "image-entry" : "text-entry"}`} key={entry.id ?? `${index}-${entry.kind}`}>
-            <div className="gallery-meta"><span>Round {index + 1}</span><b>{entry.kind.replace("-", " ")}</b><small>{entry.playerName ?? room.players.find((p) => p.id === entry.playerId)?.name}</small></div>
-            {entry.imageData ? <button className="gallery-image" onClick={() => downloadEntry(entry, index)} title="Download this drawing"><img src={entry.imageData} alt={`Round ${index + 1} drawing`} /><span>↓ save image</span></button> : <blockquote>{entry.text}</blockquote>}
+          <article className={`gallery-entry ${entry.metadata?.expired ? "expired-entry" : entry.imageData ? "image-entry" : "text-entry"}`} key={entry.id ?? `${index}-${entry.kind}`}>
+            <div className="gallery-meta"><span>Round {entry.round}</span><b>{entry.kind.replace("-", " ")}</b><small>{entry.playerName ?? room.players.find((p) => p.id === entry.playerId)?.name}</small></div>
+            {entry.metadata?.expired ? (
+              <div className="gallery-timeout"><span>⌛</span><strong>Time ran out on this turn.</strong><small>The chain kept going without inventing a black drawing.</small></div>
+            ) : entry.imageData ? (
+              <button className="gallery-image" onClick={() => downloadEntry(entry, index)} title="Download this drawing"><img loading="lazy" decoding="async" src={entry.imageData} alt={`Round ${entry.round} drawing`} /><span>↓ save image</span></button>
+            ) : <blockquote>{entry.text}</blockquote>}
             {entry.rule && <p className="gallery-rule">Rule: {entry.rule}</p>}
             {index < entries.length - 1 && <i className="chain-arrow">↓</i>}
           </article>
