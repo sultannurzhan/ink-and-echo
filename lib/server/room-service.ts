@@ -1,6 +1,11 @@
 import "server-only";
 
+import {
+  ImageDataUrlValidationError,
+  validateImageDataUrl,
+} from "./image-data-url";
 import { roomDatabase } from "./room-db";
+import { isTurnExpired } from "./room-deadline";
 import {
   addBlindClue,
   advanceAfterDrawing,
@@ -20,7 +25,13 @@ import {
 const ROOM_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const MAX_TEXT_LENGTH = 500;
 const MAX_CLUE_LENGTH = 120;
-const MAX_IMAGE_DATA_LENGTH = 1_500_000;
+const ONLINE_WINDOW_MS = 45_000;
+const PRESENCE_WRITE_INTERVAL_MS = 10_000;
+const WAITING_RETENTION_MS = 24 * 60 * 60 * 1_000;
+const PLAYING_RETENTION_MS = 48 * 60 * 60 * 1_000;
+const FINISHED_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
+const TRANSPARENT_PIXEL =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 
 interface RoomRow {
   code: string;
@@ -29,6 +40,8 @@ interface RoomRow {
   settings_json: string;
   game_state_json: string;
   version: number;
+  last_activity_at: number;
+  expires_at: number;
   created_at: number;
   updated_at: number;
 }
@@ -39,7 +52,10 @@ interface PlayerRow {
   name: string;
   seat: number;
   token_hash: string;
+  recovery_hash: string;
   joined_at: number;
+  last_seen_at: number;
+  left_at: number | null;
 }
 
 interface EntryRow {
@@ -56,6 +72,18 @@ interface EntryRow {
   created_at: number;
 }
 
+interface EntryMetaRow {
+  id: string;
+  ordinal: number;
+  round: number;
+  author_player_id: string;
+  kind: string;
+  metadata_json: string;
+  created_at: number;
+  has_text: number;
+  has_image: number;
+}
+
 export interface PlayerCredentials {
   playerId: string;
   playerToken: string;
@@ -70,6 +98,21 @@ export interface RoomAction {
   kind?: unknown;
   settings?: unknown;
 }
+
+interface RateLimitRow {
+  request_count: number;
+  window_started_at: number;
+}
+
+export type RoomRateLimitScope =
+  | "create"
+  | "join"
+  | "poll"
+  | "action"
+  | "recover"
+  | "heartbeat"
+  | "leave"
+  | "delete";
 
 export class RoomServiceError extends Error {
   readonly status: number;
@@ -99,11 +142,120 @@ function fail(
   throw new RoomServiceError(status, errorCode, message, details);
 }
 
+const RATE_LIMITS: Record<RoomRateLimitScope, { limit: number; windowMs: number }> = {
+  create: { limit: 10, windowMs: 10 * 60_000 },
+  join: { limit: 30, windowMs: 10 * 60_000 },
+  poll: { limit: 180, windowMs: 60_000 },
+  action: { limit: 60, windowMs: 60_000 },
+  recover: { limit: 10, windowMs: 10 * 60_000 },
+  heartbeat: { limit: 12, windowMs: 60_000 },
+  leave: { limit: 10, windowMs: 60_000 },
+  delete: { limit: 5, windowMs: 10 * 60_000 },
+};
+const GLOBAL_IP_RATE_LIMIT = { limit: 300, windowMs: 60_000 } as const;
+
+function requestAddress(request: Request): string {
+  return (
+    request.headers.get("cf-connecting-ip") ??
+    "local"
+  ).slice(0, 80);
+}
+
+export async function enforceRoomRateLimit(
+  request: Request,
+  scope: RoomRateLimitScope,
+  identity = "anonymous",
+) {
+  const database = await roomDatabase();
+  const now = Date.now();
+  const config = RATE_LIMITS[scope];
+  const address = requestAddress(request);
+  const globalRow = await consumeRateBucket(
+    database,
+    `global-ip:${address}`,
+    now,
+    GLOBAL_IP_RATE_LIMIT.windowMs,
+  );
+  enforceRateBucketResult(globalRow, GLOBAL_IP_RATE_LIMIT, now);
+
+  const scopedRow = await consumeRateBucket(
+    database,
+    `${scope}:${address}:${identity.slice(0, 100)}`,
+    now,
+    config.windowMs,
+  );
+  enforceRateBucketResult(scopedRow, config, now);
+
+  const random = new Uint8Array(1);
+  crypto.getRandomValues(random);
+  if (random[0] < 8) {
+    await database
+      .prepare("DELETE FROM rate_limit_buckets WHERE expires_at < ?")
+      .bind(now)
+      .run();
+  }
+}
+
+async function consumeRateBucket(
+  database: D1Database,
+  bucketKey: string,
+  now: number,
+  windowMs: number,
+): Promise<RateLimitRow> {
+  const resetBefore = now - windowMs;
+  const row = await database
+    .prepare(`INSERT INTO rate_limit_buckets (
+      bucket_key, window_started_at, request_count, expires_at
+    ) VALUES (?, ?, 1, ?)
+    ON CONFLICT(bucket_key) DO UPDATE SET
+      request_count = CASE
+        WHEN rate_limit_buckets.window_started_at <= ? THEN 1
+        ELSE rate_limit_buckets.request_count + 1
+      END,
+      window_started_at = CASE
+        WHEN rate_limit_buckets.window_started_at <= ? THEN excluded.window_started_at
+        ELSE rate_limit_buckets.window_started_at
+      END,
+      expires_at = excluded.expires_at
+    RETURNING request_count, window_started_at`)
+    .bind(bucketKey, now, now + windowMs * 2, resetBefore, resetBefore)
+    .first<RateLimitRow>();
+
+  if (!row) fail(500, "rate_limit_unavailable", "Could not check the request limit.");
+  return row;
+}
+
+function enforceRateBucketResult(
+  row: RateLimitRow,
+  config: { limit: number; windowMs: number },
+  now: number,
+) {
+  if (row.request_count > config.limit) {
+    const retryAfterSeconds = Math.max(
+      1,
+      Math.ceil((row.window_started_at + config.windowMs - now) / 1_000),
+    );
+    fail(429, "rate_limited", "Too many requests. Please pause briefly and try again.", {
+      retryAfterSeconds,
+    });
+  }
+}
+
 function parseJson<T>(value: string, fallback: T): T {
   try {
     return JSON.parse(value) as T;
   } catch {
     return fallback;
+  }
+}
+
+function parsePersistedObject<T>(value: string, label: string): T {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
+    return parsed as T;
+  } catch {
+    fail(500, "invalid_persisted_state", `The stored ${label} is unreadable. Please delete this room and start a new one.`);
   }
 }
 
@@ -143,20 +295,76 @@ async function tokenHash(token: string): Promise<string> {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+function retentionMs(status: RoomStatus): number {
+  if (status === "waiting") return WAITING_RETENTION_MS;
+  if (status === "playing") return PLAYING_RETENTION_MS;
+  return FINISHED_RETENTION_MS;
+}
+
+function nextExpiry(status: RoomStatus, now: number): number {
+  return now + retentionMs(status);
+}
+
+async function deleteRoomData(database: D1Database, code: string) {
+  await database.prepare("DELETE FROM rooms WHERE code = ?").bind(code).run();
+}
+
+export async function cleanupExpiredRooms(database?: D1Database) {
+  const target = database ?? await roomDatabase();
+  const now = Date.now();
+  const expired = await target
+    .prepare(`SELECT code FROM rooms WHERE expires_at > 0 AND expires_at < ?
+      ORDER BY expires_at ASC LIMIT 20`)
+    .bind(now)
+    .all<{ code: string }>();
+  if (!expired.results.length) return 0;
+
+  const placeholders = expired.results.map(() => "?").join(", ");
+  const codes = expired.results.map((room) => room.code);
+  await target.batch([
+    target
+      .prepare(`DELETE FROM room_entries WHERE room_code IN (${placeholders})`)
+      .bind(...codes),
+    target
+      .prepare(`DELETE FROM players WHERE room_code IN (${placeholders})`)
+      .bind(...codes),
+    target
+      .prepare(`DELETE FROM rooms WHERE code IN (${placeholders})`)
+      .bind(...codes),
+  ]);
+  return codes.length;
+}
+
 async function roomRow(database: D1Database, code: string): Promise<RoomRow> {
   const room = await database
     .prepare(`SELECT code, host_player_id, status, settings_json, game_state_json,
-      version, created_at, updated_at FROM rooms WHERE code = ?`)
+      version, last_activity_at, expires_at, created_at, updated_at
+      FROM rooms WHERE code = ?`)
     .bind(code)
     .first<RoomRow>();
   if (!room) fail(404, "room_not_found", "That room does not exist.");
+  if (room.expires_at > 0 && room.expires_at < Date.now()) {
+    await deleteRoomData(database, code);
+    fail(410, "room_expired", "This room has expired.");
+  }
   return room;
 }
 
 async function roomPlayers(database: D1Database, code: string): Promise<PlayerRow[]> {
   const result = await database
-    .prepare(`SELECT id, room_code, name, seat, token_hash, joined_at
-      FROM players WHERE room_code = ? ORDER BY seat ASC`)
+    .prepare(`SELECT id, room_code, name, seat, token_hash, recovery_hash,
+      joined_at, last_seen_at, left_at
+      FROM players WHERE room_code = ? AND left_at IS NULL ORDER BY seat ASC`)
+    .bind(code)
+    .all<PlayerRow>();
+  return result.results;
+}
+
+async function allRoomPlayers(database: D1Database, code: string): Promise<PlayerRow[]> {
+  const result = await database
+    .prepare(`SELECT id, room_code, name, seat, token_hash, recovery_hash,
+      joined_at, last_seen_at, left_at
+      FROM players WHERE room_code = ? ORDER BY joined_at ASC`)
     .bind(code)
     .all<PlayerRow>();
   return result.results;
@@ -171,7 +379,28 @@ async function authenticate(
     fail(401, "player_auth_required", "Player credentials are required.");
   }
   const player = await database
-    .prepare(`SELECT id, room_code, name, seat, token_hash, joined_at
+    .prepare(`SELECT id, room_code, name, seat, token_hash, recovery_hash,
+      joined_at, last_seen_at, left_at
+      FROM players WHERE room_code = ? AND id = ? AND left_at IS NULL`)
+    .bind(code, credentials.playerId)
+    .first<PlayerRow>();
+  if (!player || player.token_hash !== await tokenHash(credentials.playerToken)) {
+    fail(401, "invalid_player_auth", "These player credentials are not valid for the room.");
+  }
+  return player;
+}
+
+async function authenticateLeaveReplay(
+  database: D1Database,
+  code: string,
+  credentials: PlayerCredentials,
+): Promise<PlayerRow> {
+  if (!credentials.playerId || !credentials.playerToken) {
+    fail(401, "player_auth_required", "Player credentials are required.");
+  }
+  const player = await database
+    .prepare(`SELECT id, room_code, name, seat, token_hash, recovery_hash,
+      joined_at, last_seen_at, left_at
       FROM players WHERE room_code = ? AND id = ?`)
     .bind(code, credentials.playerId)
     .first<PlayerRow>();
@@ -181,13 +410,27 @@ async function authenticate(
   return player;
 }
 
-function publicPlayer(player: PlayerRow, hostPlayerId: string) {
+function publicPlayer(player: PlayerRow, hostPlayerId: string, now = Date.now()) {
   return {
     id: player.id,
     name: player.name,
     seat: player.seat as 0 | 1,
     isHost: player.id === hostPlayerId,
+    lastSeenAt: player.last_seen_at,
+    isOnline: player.last_seen_at >= now - ONLINE_WINDOW_MS,
   };
+}
+
+function presenceVersionFor(players: PlayerRow[], now: number): number {
+  let hash = 2166136261;
+  for (const player of players) {
+    const value = `${player.id}:${player.last_seen_at}:${player.last_seen_at >= now - ONLINE_WINDOW_MS ? 1 : 0};`;
+    for (let index = 0; index < value.length; index += 1) {
+      hash ^= value.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+  }
+  return hash >>> 0;
 }
 
 function entryFromRow(row: EntryRow, players: PlayerRow[]) {
@@ -266,9 +509,13 @@ function publicTurn(
         ? turn.suggestedPrompt
         : visibleSource?.text ?? undefined,
     clue: turn.clues?.at(-1),
+    canAddClue:
+      internalTurn.kind === "blind-drawing" &&
+      internalTurn.promptAuthorId === viewerPlayerId &&
+      internalTurn.actorPlayerId !== viewerPlayerId,
     duoBeat:
-      state.turnNumber > 0 && state.turnNumber % 4 === 0
-        ? DUO_BEATS[(state.turnNumber / 4 - 1) % DUO_BEATS.length]
+      state.round > 0 && state.round % 4 === 0
+        ? DUO_BEATS[(state.round / 4 - 1) % DUO_BEATS.length]
         : undefined,
     previousText: visibleSource?.text ?? undefined,
     previousImage: visibleSource?.imageData ?? undefined,
@@ -282,19 +529,27 @@ async function snapshotFromRows(args: {
   viewer: PlayerRow;
 }) {
   const { database, room, players, viewer } = args;
-  const settings = parseJson<RoomSettings>(room.settings_json, normalizeSettings({}));
-  const state = parseJson<StoredGameState>(room.game_state_json, waitingState());
-  const entriesResult = await database
-    .prepare(`SELECT id, room_code, ordinal, room_version, round, author_player_id,
-      kind, text_content, image_data, metadata_json, created_at
+  const serverNow = Date.now();
+  const attributionPlayers = await allRoomPlayers(database, room.code);
+  const settings = parsePersistedObject<RoomSettings>(room.settings_json, "room settings");
+  const state = parsePersistedObject<StoredGameState>(room.game_state_json, "game state");
+  const metadataResult = await database
+    .prepare(`SELECT id, ordinal, round, author_player_id, kind, metadata_json,
+      created_at, text_content IS NOT NULL AS has_text,
+      image_data IS NOT NULL AS has_image
       FROM room_entries WHERE room_code = ? ORDER BY ordinal ASC`)
     .bind(room.code)
-    .all<EntryRow>();
-  const entries = entriesResult.results.map((entry) => entryFromRow(entry, players));
+    .all<EntryMetaRow>();
   const turn = state.currentTurn;
-  const source = turn?.sourceEntryId
-    ? entries.find((entry) => entry.id === turn.sourceEntryId) ?? null
+  const sourceRow = turn?.sourceEntryId
+    ? await database
+        .prepare(`SELECT id, room_code, ordinal, room_version, round, author_player_id,
+          kind, text_content, image_data, metadata_json, created_at
+          FROM room_entries WHERE room_code = ? AND id = ?`)
+        .bind(room.code, turn.sourceEntryId)
+        .first<EntryRow>()
     : null;
+  const source = sourceRow ? entryFromRow(sourceRow, attributionPlayers) : null;
 
   let currentSource: ReturnType<typeof entryFromRow> | ReturnType<typeof hiddenEntry> | null = source;
   if (source && turn?.kind === "blind-drawing" && viewer.id === turn.actorPlayerId) {
@@ -305,11 +560,41 @@ async function snapshotFromRows(args: {
   }
 
   const status = room.status;
-  const gallery = entries.map((entry) => ({
-    ...entry,
-    playerId: entry.authorPlayerId,
-    playerName: entry.authorName,
-    rule: typeof entry.metadata.rule === "string" ? entry.metadata.rule : undefined,
+  const presenceVersion = presenceVersionFor(players, serverNow);
+  let gallery: Array<ReturnType<typeof entryFromRow> & {
+    playerId: string;
+    playerName: string;
+    rule?: string;
+  }> = [];
+  if (status === "finished") {
+    const galleryRows = await database
+      .prepare(`SELECT id, room_code, ordinal, room_version, round, author_player_id,
+        kind, text_content, image_data, metadata_json, created_at
+        FROM room_entries WHERE room_code = ? ORDER BY ordinal ASC`)
+      .bind(room.code)
+      .all<EntryRow>();
+    gallery = galleryRows.results.map((row) => {
+      const entry = entryFromRow(row, attributionPlayers);
+      return {
+        ...entry,
+        playerId: entry.authorPlayerId,
+        playerName: entry.authorName,
+        rule: typeof entry.metadata.rule === "string" ? entry.metadata.rule : undefined,
+      };
+    });
+  }
+  const galleryMetadata = metadataResult.results.map((entry) => ({
+    id: entry.id,
+    ordinal: entry.ordinal,
+    round: entry.round,
+    playerId: entry.author_player_id,
+    playerName:
+      attributionPlayers.find((player) => player.id === entry.author_player_id)?.name ?? "Player",
+    kind: entry.kind,
+    rule: parseJson<Record<string, unknown>>(entry.metadata_json, {}).rule ?? undefined,
+    hasText: Boolean(entry.has_text),
+    hasImage: Boolean(entry.has_image),
+    createdAt: entry.created_at,
   }));
   return {
     code: room.code,
@@ -320,7 +605,7 @@ async function snapshotFromRows(args: {
     activePlayerId: turn?.actorPlayerId ?? null,
     viewerPlayerId: viewer.id,
     settings,
-    players: players.map((player) => publicPlayer(player, room.host_player_id)),
+    players: players.map((player) => publicPlayer(player, room.host_player_id, serverNow)),
     round: state.round,
     totalRounds: settings.rounds,
     turnNumber: state.turnNumber,
@@ -328,8 +613,13 @@ async function snapshotFromRows(args: {
     totalTurns: settings.rounds,
     currentTurn: publicTurn(state, currentSource, viewer.id),
     currentSource,
-    chainLength: entries.length,
+    chainLength: metadataResult.results.length,
     gallery: status === "finished" ? gallery : [],
+    galleryMetadata,
+    serverNow,
+    presenceVersion,
+    lastActivityAt: room.last_activity_at,
+    expiresAt: room.expires_at,
     createdAt: room.created_at,
     updatedAt: room.updated_at,
   };
@@ -339,17 +629,45 @@ export async function getRoomSnapshot(
   rawCode: string,
   credentials: PlayerCredentials,
   sinceVersion?: number,
+  sincePresenceVersion?: number,
 ) {
   const code = normalizeRoomCode(rawCode);
   const database = await roomDatabase();
-  const room = await roomRow(database, code);
+  let room = await roomRow(database, code);
   const viewer = await authenticate(database, code, credentials);
+  await touchPlayer(database, viewer.id);
+  let players = await roomPlayers(database, code);
+  const settings = parsePersistedObject<RoomSettings>(room.settings_json, "room settings");
+  const state = parsePersistedObject<StoredGameState>(room.game_state_json, "game state");
 
-  if (Number.isInteger(sinceVersion) && sinceVersion === room.version) {
+  if (room.status === "playing" && isTurnExpired(state, Date.now())) {
+    try {
+      await expireCurrentTurn({
+        database,
+        room,
+        players,
+        settings,
+        state,
+        now: Date.now(),
+      });
+    } catch (error) {
+      if (!(error instanceof RoomServiceError) || error.errorCode !== "version_conflict") {
+        throw error;
+      }
+    }
+    room = await roomRow(database, code);
+    players = await roomPlayers(database, code);
+  }
+
+  if (
+    Number.isInteger(sinceVersion) &&
+    sinceVersion === room.version &&
+    Number.isInteger(sincePresenceVersion) &&
+    sincePresenceVersion === presenceVersionFor(players, Date.now())
+  ) {
     return { unchanged: true as const, code, version: room.version };
   }
 
-  const players = await roomPlayers(database, code);
   return snapshotFromRows({ database, room, players, viewer });
 }
 
@@ -361,10 +679,13 @@ export async function createRoom(input: {
   const name = playerName(input.name ?? input.playerName);
   const settings = normalizeSettings(input.settings);
   const database = await roomDatabase();
+  await cleanupExpiredRooms(database);
   const now = Date.now();
   const hostPlayerId = crypto.randomUUID();
   const playerToken = randomToken();
   const hash = await tokenHash(playerToken);
+  const recoverySecret = randomToken();
+  const recoveryHash = await tokenHash(recoverySecret);
 
   for (let attempt = 0; attempt < 8; attempt += 1) {
     const code = roomCode();
@@ -373,14 +694,24 @@ export async function createRoom(input: {
         database
           .prepare(`INSERT INTO rooms (
             code, host_player_id, status, settings_json, game_state_json,
-            version, created_at, updated_at
-          ) VALUES (?, ?, 'waiting', ?, ?, 1, ?, ?)`)
-          .bind(code, hostPlayerId, JSON.stringify(settings), JSON.stringify(waitingState()), now, now),
+            version, last_activity_at, expires_at, created_at, updated_at
+          ) VALUES (?, ?, 'waiting', ?, ?, 1, ?, ?, ?, ?)`)
+          .bind(
+            code,
+            hostPlayerId,
+            JSON.stringify(settings),
+            JSON.stringify(waitingState()),
+            now,
+            nextExpiry("waiting", now),
+            now,
+            now,
+          ),
         database
           .prepare(`INSERT INTO players (
-            id, room_code, name, seat, token_hash, joined_at
-          ) VALUES (?, ?, ?, 0, ?, ?)`)
-          .bind(hostPlayerId, code, name, hash, now),
+            id, room_code, name, seat, token_hash, recovery_hash,
+            joined_at, last_seen_at, left_at
+          ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, NULL)`)
+          .bind(hostPlayerId, code, name, hash, recoveryHash, now, now),
       ]);
 
       const room = await roomRow(database, code);
@@ -391,9 +722,12 @@ export async function createRoom(input: {
         player: publicPlayer(players[0], hostPlayerId),
         playerId: hostPlayerId,
         playerToken,
+        recoverySecret,
+        recoveryToken: recoverySecret,
       };
     } catch (error) {
-      if (attempt === 7) throw error;
+      const isCodeCollision = String(error).includes("UNIQUE constraint failed: rooms.code");
+      if (!isCodeCollision || attempt === 7) throw error;
     }
   }
 
@@ -424,19 +758,31 @@ export async function joinRoom(
   const id = crypto.randomUUID();
   const playerToken = randomToken();
   const hash = await tokenHash(playerToken);
+  const recoverySecret = randomToken();
+  const recoveryHash = await tokenHash(recoverySecret);
 
   try {
     const result = await database.batch([
       database
-        .prepare(`INSERT INTO players (id, room_code, name, seat, token_hash, joined_at)
-          SELECT ?, code, ?, 1, ?, ? FROM rooms
-          WHERE code = ? AND status = 'waiting'`)
-        .bind(id, name, hash, now, code),
+        .prepare(`INSERT INTO players (
+          id, room_code, name, seat, token_hash, recovery_hash,
+          joined_at, last_seen_at, left_at
+        )
+          SELECT ?, room.code, ?,
+            CASE WHEN EXISTS (
+              SELECT 1 FROM players occupied
+              WHERE occupied.room_code = room.code AND occupied.seat = 0
+                AND occupied.left_at IS NULL
+            ) THEN 1 ELSE 0 END,
+            ?, ?, ?, ?, NULL FROM rooms room
+          WHERE room.code = ? AND room.status = 'waiting'`)
+        .bind(id, name, hash, recoveryHash, now, now, code),
       database
-        .prepare(`UPDATE rooms SET version = version + 1, updated_at = ?
+        .prepare(`UPDATE rooms SET version = version + 1, updated_at = ?,
+          last_activity_at = ?, expires_at = ?
           WHERE code = ? AND status = 'waiting'
           AND EXISTS (SELECT 1 FROM players WHERE room_code = ? AND id = ?)`)
-        .bind(now, code, code, id),
+        .bind(now, now, nextExpiry("waiting", now), code, code, id),
     ]);
     if (changes(result[0]) !== 1 || changes(result[1]) !== 1) {
       fail(409, "join_conflict", "The room changed while you were joining. Please try again.");
@@ -459,7 +805,202 @@ export async function joinRoom(
     player: publicPlayer(viewer, updatedRoom.host_player_id),
     playerId: viewer.id,
     playerToken,
+    recoverySecret,
+    recoveryToken: recoverySecret,
   };
+}
+
+export async function recoverRoomSession(
+  rawCode: string,
+  input: { playerId?: unknown; recoverySecret?: unknown; recoveryToken?: unknown },
+) {
+  const code = normalizeRoomCode(rawCode);
+  const playerId = typeof input.playerId === "string" ? input.playerId.trim() : "";
+  const recoverySecret =
+    typeof input.recoverySecret === "string"
+      ? input.recoverySecret.trim()
+      : typeof input.recoveryToken === "string"
+        ? input.recoveryToken.trim()
+        : "";
+  if (!playerId || !recoverySecret) {
+    fail(400, "recovery_credentials_required", "Player ID and recovery secret are required.");
+  }
+
+  const database = await roomDatabase();
+  const room = await roomRow(database, code);
+  const players = await roomPlayers(database, code);
+  const player = players.find((candidate) => candidate.id === playerId);
+  const suppliedHash = await tokenHash(recoverySecret);
+  if (!player || !player.recovery_hash || player.recovery_hash !== suppliedHash) {
+    fail(401, "invalid_recovery_auth", "The recovery credential is not valid for this player.");
+  }
+
+  const now = Date.now();
+  const playerToken = randomToken();
+  const newTokenHash = await tokenHash(playerToken);
+  const nextRecoveryToken = randomToken();
+  const nextRecoveryHash = await tokenHash(nextRecoveryToken);
+  const rotation = await database
+    .prepare(`UPDATE players SET token_hash = ?, recovery_hash = ?,
+      last_seen_at = ?, left_at = NULL
+      WHERE room_code = ? AND id = ? AND recovery_hash = ?`)
+    .bind(newTokenHash, nextRecoveryHash, now, code, playerId, suppliedHash)
+    .run();
+  if (changes(rotation) !== 1) {
+    fail(401, "invalid_recovery_auth", "The recovery credential has already been rotated.");
+  }
+  await database
+    .prepare(`UPDATE rooms SET updated_at = ?, last_activity_at = ?, expires_at = ?
+      WHERE code = ?`)
+    .bind(now, now, nextExpiry(room.status, now), code)
+    .run();
+
+  const updatedRoom = await roomRow(database, code);
+  const updatedPlayers = await roomPlayers(database, code);
+  const viewer = updatedPlayers.find((candidate) => candidate.id === playerId);
+  if (!viewer) fail(409, "recovery_conflict", "The player is no longer in this room.");
+  return {
+    room: await snapshotFromRows({ database, room: updatedRoom, players: updatedPlayers, viewer }),
+    player: publicPlayer(viewer, updatedRoom.host_player_id),
+    playerId,
+    playerToken,
+    recoverySecret: nextRecoveryToken,
+    recoveryToken: nextRecoveryToken,
+  };
+}
+
+export async function heartbeatRoom(
+  rawCode: string,
+  credentials: PlayerCredentials,
+) {
+  const code = normalizeRoomCode(rawCode);
+  const database = await roomDatabase();
+  const room = await roomRow(database, code);
+  const viewer = await authenticate(database, code, credentials);
+  const now = Date.now();
+  await touchPlayer(database, viewer.id, now, true);
+  await database
+    .prepare(`UPDATE rooms SET updated_at = ?, last_activity_at = ?, expires_at = ?
+      WHERE code = ?`)
+    .bind(now, now, nextExpiry(room.status, now), code)
+    .run();
+  const updatedRoom = await roomRow(database, code);
+  const players = await roomPlayers(database, code);
+  const updatedViewer = players.find((player) => player.id === viewer.id) ?? viewer;
+  return {
+    room: await snapshotFromRows({
+      database,
+      room: updatedRoom,
+      players,
+      viewer: updatedViewer,
+    }),
+  };
+}
+
+export async function leaveRoom(
+  rawCode: string,
+  credentials: PlayerCredentials,
+) {
+  const code = normalizeRoomCode(rawCode);
+  const database = await roomDatabase();
+  const room = await roomRow(database, code);
+  const actor = await authenticateLeaveReplay(database, code, credentials);
+  const players = await roomPlayers(database, code);
+  const remaining = players.find((player) => player.id !== actor.id);
+
+  if (actor.left_at !== null) {
+    if (!remaining) {
+      return { left: true as const, roomDeleted: true as const, code };
+    }
+    return {
+      left: true as const,
+      roomDeleted: false as const,
+      code,
+      hostPlayerId: room.host_player_id,
+      status: room.status,
+    };
+  }
+
+  const now = Date.now();
+  const roomDeleted = !remaining;
+  const nextStatus: RoomStatus = room.status === "playing" || roomDeleted
+    ? "finished"
+    : room.status;
+  const currentState = parsePersistedObject<StoredGameState>(room.game_state_json, "game state");
+  const nextState = room.status === "playing" || roomDeleted
+    ? { ...currentState, currentTurn: null }
+    : currentState;
+  const nextHostPlayerId = remaining && room.host_player_id === actor.id
+    ? remaining.id
+    : room.host_player_id;
+  const expiry = roomDeleted
+    ? now + WAITING_RETENTION_MS
+    : nextExpiry(nextStatus, now);
+  const result = await database.batch([
+    database
+      .prepare(`UPDATE players SET left_at = ?, last_seen_at = ?
+        WHERE room_code = ? AND id = ? AND left_at IS NULL
+        AND EXISTS (
+          SELECT 1 FROM rooms
+          WHERE rooms.code = ? AND rooms.version = ?
+        )`)
+      .bind(now, now, code, actor.id, code, room.version),
+    database
+      .prepare(`UPDATE rooms SET host_player_id = ?, status = ?, game_state_json = ?,
+        version = version + 1, updated_at = ?, last_activity_at = ?, expires_at = ?
+        WHERE code = ? AND version = ?`)
+      .bind(
+        nextHostPlayerId,
+        nextStatus,
+        JSON.stringify(nextState),
+        now,
+        now,
+        expiry,
+        code,
+        room.version,
+      ),
+  ]);
+  if (changes(result[0]) !== 1 || changes(result[1]) !== 1) {
+    const replayActor = await authenticateLeaveReplay(database, code, credentials);
+    if (replayActor.left_at !== null) {
+      const replayRoom = await roomRow(database, code);
+      const replayPlayers = await roomPlayers(database, code);
+      const replayRemaining = replayPlayers.find((player) => player.id !== actor.id);
+      return replayRemaining
+        ? {
+            left: true as const,
+            roomDeleted: false as const,
+            code,
+            hostPlayerId: replayRoom.host_player_id,
+            status: replayRoom.status,
+          }
+        : { left: true as const, roomDeleted: true as const, code };
+    }
+    fail(409, "version_conflict", "The room changed while the player was leaving.");
+  }
+  if (roomDeleted) {
+    return { left: true as const, roomDeleted: true as const, code };
+  }
+  return {
+    left: true as const,
+    roomDeleted: false as const,
+    code,
+    hostPlayerId: nextHostPlayerId,
+    status: nextStatus,
+  };
+}
+
+export async function deleteRoom(
+  rawCode: string,
+  credentials: PlayerCredentials,
+) {
+  const code = normalizeRoomCode(rawCode);
+  const database = await roomDatabase();
+  const room = await roomRow(database, code);
+  const actor = await authenticate(database, code, credentials);
+  requireHost(room, actor);
+  await deleteRoomData(database, code);
+  return { deleted: true as const, code };
 }
 
 function expectedVersion(payload: RoomAction, current: number): number {
@@ -509,16 +1050,20 @@ function safeClue(value: unknown): string {
 }
 
 function safeImageData(value: unknown): string {
-  if (typeof value !== "string" || !value) {
-    fail(400, "invalid_drawing", "Drawing image data is required.");
+  try {
+    return validateImageDataUrl(value);
+  } catch (error) {
+    if (error instanceof ImageDataUrlValidationError) {
+      if (error.code === "too_large") {
+        fail(413, "drawing_too_large", "The drawing is too large. Export a smaller canvas image.");
+      }
+      if (error.code === "invalid_dimensions") {
+        fail(400, "invalid_drawing_dimensions", error.message);
+      }
+      fail(400, "invalid_drawing", error.message);
+    }
+    throw error;
   }
-  if (value.length > MAX_IMAGE_DATA_LENGTH) {
-    fail(413, "drawing_too_large", "The drawing is too large. Export a smaller canvas image.");
-  }
-  if (!/^data:image\/(png|jpeg|webp);base64,[a-z0-9+/=\r\n]+$/i.test(value)) {
-    fail(400, "invalid_drawing", "Drawings must be PNG, JPEG, or WebP data URLs.");
-  }
-  return value;
 }
 
 function toGamePlayers(players: PlayerRow[]): RoomPlayer[] {
@@ -538,15 +1083,19 @@ async function updateRoomState(args: {
   settings?: RoomSettings;
 }) {
   const { database, room, expectedVersion: version, state } = args;
+  const status = args.status ?? room.status;
+  const now = Date.now();
   const result = await database
     .prepare(`UPDATE rooms SET status = ?, settings_json = ?, game_state_json = ?,
-      version = version + 1, updated_at = ?
+      version = version + 1, updated_at = ?, last_activity_at = ?, expires_at = ?
       WHERE code = ? AND version = ?`)
     .bind(
-      args.status ?? room.status,
-      JSON.stringify(args.settings ?? parseJson<RoomSettings>(room.settings_json, normalizeSettings({}))),
+      status,
+      JSON.stringify(args.settings ?? parsePersistedObject<RoomSettings>(room.settings_json, "room settings")),
       JSON.stringify(state),
-      Date.now(),
+      now,
+      now,
+      nextExpiry(status, now),
       room.code,
       version,
     )
@@ -565,6 +1114,7 @@ async function commitEntry(args: {
   entry: EntryDraft;
 }) {
   const { database, room, expectedVersion: version, state, status, entry } = args;
+  const now = Date.now();
   const result = await database.batch([
     database
       .prepare(`INSERT INTO room_entries (
@@ -591,14 +1141,118 @@ async function commitEntry(args: {
       ),
     database
       .prepare(`UPDATE rooms SET status = ?, game_state_json = ?,
-        version = version + 1, updated_at = ?
+        version = version + 1, updated_at = ?, last_activity_at = ?, expires_at = ?
         WHERE code = ? AND version = ? AND status = 'playing'`)
-      .bind(status, JSON.stringify(state), Date.now(), room.code, version),
+      .bind(
+        status,
+        JSON.stringify(state),
+        now,
+        now,
+        nextExpiry(status, now),
+        room.code,
+        version,
+      ),
   ]);
 
   if (changes(result[0]) !== 1 || changes(result[1]) !== 1) {
     fail(409, "version_conflict", "The room changed; refresh its state and try again.");
   }
+}
+
+async function touchPlayer(
+  database: D1Database,
+  playerId: string,
+  now = Date.now(),
+  force = false,
+): Promise<boolean> {
+  const result = await database
+    .prepare(`UPDATE players SET last_seen_at = ?
+      WHERE id = ? AND left_at IS NULL AND (? OR last_seen_at < ?)`)
+    .bind(now, playerId, force ? 1 : 0, now - PRESENCE_WRITE_INTERVAL_MS)
+    .run();
+  return changes(result) === 1;
+}
+
+async function expireCurrentTurn(args: {
+  database: D1Database;
+  room: RoomRow;
+  players: PlayerRow[];
+  settings: RoomSettings;
+  state: StoredGameState;
+  now: number;
+  force?: boolean;
+}): Promise<boolean> {
+  const { database, room, players, settings, state, now, force = false } = args;
+  const turn = state.currentTurn;
+  if (room.status !== "playing" || !turn) return false;
+  if (!force && !isTurnExpired(state, now)) return false;
+  if (force && now < turn.deadlineAt) {
+    fail(409, "turn_not_expired", "This turn still has time remaining.", {
+      serverNow: now,
+      deadlineAt: turn.deadlineAt,
+    });
+  }
+
+  const entryId = crypto.randomUUID();
+  const textKind = expectedTextKind(turn.kind);
+  let advanced: ReturnType<typeof advanceAfterText> | ReturnType<typeof advanceAfterDrawing>;
+  let textContent: string | null = null;
+  let imageData: string | null = null;
+  let entryKind: string;
+
+  if (textKind) {
+    textContent = textKind === "prompt"
+      ? "A mysterious surprise appeared"
+      : textKind === "caption"
+        ? "Meanwhile, time slipped away."
+        : "Time ran out";
+    advanced = advanceAfterText({
+      settings,
+      state,
+      players: toGamePlayers(players),
+      actorPlayerId: turn.actorPlayerId,
+      entryId,
+      text: textContent,
+      now,
+    });
+    entryKind = textKind;
+  } else if (isDrawingTurn(turn.kind)) {
+    imageData = TRANSPARENT_PIXEL;
+    advanced = advanceAfterDrawing({
+      settings,
+      state,
+      players: toGamePlayers(players),
+      actorPlayerId: turn.actorPlayerId,
+      entryId,
+      now,
+    });
+    entryKind = turn.kind === "seed-drawing" ? "drawing" : turn.kind;
+  } else {
+    return false;
+  }
+
+  await commitEntry({
+    database,
+    room,
+    expectedVersion: room.version,
+    state: advanced.state,
+    status: advanced.finished ? "finished" : "playing",
+    entry: {
+      id: entryId,
+      round: state.round,
+      authorPlayerId: turn.actorPlayerId,
+      kind: entryKind,
+      textContent,
+      imageData,
+      metadata: {
+        expired: true,
+        sourceEntryId: turn.sourceEntryId ?? null,
+        rule: turn.rule ?? null,
+      },
+      createdAt: now,
+    },
+  });
+  return true;
 }
 
 async function resetRoom(
@@ -614,8 +1268,16 @@ async function resetRoom(
       .bind(room.code, room.code, version),
     database
       .prepare(`UPDATE rooms SET status = 'waiting', game_state_json = ?,
-        version = version + 1, updated_at = ? WHERE code = ? AND version = ?`)
-      .bind(JSON.stringify(waitingState()), now, room.code, version),
+        version = version + 1, updated_at = ?, last_activity_at = ?, expires_at = ?
+        WHERE code = ? AND version = ?`)
+      .bind(
+        JSON.stringify(waitingState()),
+        now,
+        now,
+        nextExpiry("waiting", now),
+        room.code,
+        version,
+      ),
   ]);
   if (changes(result[1]) !== 1) {
     fail(409, "version_conflict", "The room changed; refresh its state and try again.");
@@ -628,15 +1290,56 @@ export async function performRoomAction(
   payload: RoomAction,
 ) {
   const code = normalizeRoomCode(rawCode);
-  const database = await roomDatabase();
-  const room = await roomRow(database, code);
-  const actor = await authenticate(database, code, credentials);
-  const players = await roomPlayers(database, code);
-  const settings = parseJson<RoomSettings>(room.settings_json, normalizeSettings({}));
-  const state = parseJson<StoredGameState>(room.game_state_json, waitingState());
-  const version = expectedVersion(payload, room.version);
   const actionType = typeof payload.type === "string" ? payload.type : "";
+  if (actionType === "heartbeat") return heartbeatRoom(code, credentials);
+  if (actionType === "leave_room") return leaveRoom(code, credentials);
+
+  const database = await roomDatabase();
+  let room = await roomRow(database, code);
+  const actor = await authenticate(database, code, credentials);
   const now = Date.now();
+  await touchPlayer(database, actor.id, now);
+
+  let players = await roomPlayers(database, code);
+  const settings = parsePersistedObject<RoomSettings>(room.settings_json, "room settings");
+  const state = parsePersistedObject<StoredGameState>(room.game_state_json, "game state");
+
+  if (actionType === "expire_turn") {
+    expectedVersion(payload, room.version);
+    const expired = await expireCurrentTurn({
+      database,
+      room,
+      players,
+      settings,
+      state,
+      now,
+      force: true,
+    });
+    if (!expired) fail(409, "no_active_turn", "There is no active turn to expire.");
+    room = await roomRow(database, code);
+    players = await roomPlayers(database, code);
+    return {
+      expired: true as const,
+      room: await snapshotFromRows({ database, room, players, viewer: actor }),
+    };
+  }
+
+  if (room.status === "playing" && isTurnExpired(state, now)) {
+    try {
+      await expireCurrentTurn({ database, room, players, settings, state, now });
+    } catch (error) {
+      if (!(error instanceof RoomServiceError) || error.errorCode !== "version_conflict") {
+        throw error;
+      }
+    }
+    room = await roomRow(database, code);
+    fail(409, "turn_expired", "The deadline passed, so the turn advanced without the late content.", {
+      currentVersion: room.version,
+      serverNow: now,
+    });
+  }
+
+  const version = expectedVersion(payload, room.version);
 
   if (actionType === "update_settings") {
     requireHost(room, actor);
@@ -667,6 +1370,9 @@ export async function performRoomAction(
     });
   } else if (actionType === "reset_game") {
     requireHost(room, actor);
+    if (room.status !== "waiting") {
+      fail(409, "reset_locked", "A room can only be reset while it is in the lobby.");
+    }
     await resetRoom(database, room, version);
   } else if (actionType === "submit_text") {
     requirePlaying(room);

@@ -390,13 +390,14 @@ export function advanceAfterText(args: {
       return { state: finishedState(state), finished: true };
     }
 
+    const nextArtist = otherPlayer(players, actorPlayerId);
     return {
       state: {
         round: state.round + 1,
         turnNumber: state.turnNumber + 1,
         currentTurn: makeTurn(settings, now, {
           kind: "drawing",
-          actorPlayerId,
+          actorPlayerId: nextArtist.id,
           instruction: "Draw the next panel using the last caption as your launch point.",
           sourceEntryId: entryId,
         }),
@@ -597,7 +598,6 @@ export function addBlindClue(args: {
 
   return {
     ...state,
-    turnNumber: state.turnNumber + 1,
     currentTurn: {
       ...turn,
       clues: [...existing, nextClue],

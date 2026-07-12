@@ -13,6 +13,23 @@ import {
   type PointerEvent as ReactPointerEvent,
   type WheelEvent as ReactWheelEvent,
 } from "react";
+import {
+  blobToDataUrl,
+  canvasToBlob,
+  dataUrlToBlob,
+  validateImageBlob,
+  type DrawingCanvasDraft,
+  type DrawingExportOptions,
+  type DrawingExportResult,
+  type DrawingImageType,
+  type ValidatedImage,
+} from "./drawing-draft";
+
+export type {
+  DrawingCanvasDraft,
+  DrawingExportOptions,
+  DrawingExportResult,
+} from "./drawing-draft";
 
 export type DrawingTool =
   | "pen"
@@ -29,6 +46,11 @@ export interface DrawingCanvasHandle {
     type?: "image/png" | "image/jpeg" | "image/webp",
     quality?: number,
   ) => string;
+  exportCompressed: (
+    options?: DrawingExportOptions,
+  ) => Promise<DrawingExportResult>;
+  saveDraft: () => Promise<DrawingCanvasDraft>;
+  loadDraft: (draft: DrawingCanvasDraft | string) => Promise<void>;
   loadDataUrl: (dataUrl: string) => Promise<void>;
   clear: () => void;
   undo: () => void;
@@ -60,7 +82,7 @@ interface Point {
 }
 
 interface HistoryEntry {
-  contentDataUrl: string;
+  contentBlob: Blob;
   backgroundColor: string;
 }
 
@@ -118,6 +140,11 @@ const MIN_ZOOM = 0.25;
 const MAX_ZOOM = 3;
 const MIN_BRUSH_SIZE = 1;
 const MAX_BRUSH_SIZE = 64;
+const HISTORY_WEBP_QUALITY = 0.82;
+const CHANGE_WEBP_QUALITY = 0.82;
+const DRAFT_WEBP_QUALITY = 0.88;
+const MOBILE_HISTORY_BYTES = 12 * 1024 * 1024;
+const DESKTOP_HISTORY_BYTES = 24 * 1024 * 1024;
 
 function cx(...classNames: Array<string | false | null | undefined>) {
   return classNames.filter(Boolean).join(" ");
@@ -155,34 +182,66 @@ function getContext(canvas: HTMLCanvasElement) {
   return canvas.getContext("2d", { willReadFrequently: true });
 }
 
-function decodeImage(dataUrl: string): Promise<HTMLImageElement> {
-  return new Promise((resolve, reject) => {
-    if (!dataUrl.startsWith("data:image/")) {
-      reject(new Error("DrawingCanvas can only load image data URLs."));
-      return;
-    }
+interface DecodedImage {
+  source: CanvasImageSource;
+  width: number;
+  height: number;
+  close: () => void;
+}
 
+function decodeImageBlob(blob: Blob): Promise<DecodedImage> {
+  if (typeof createImageBitmap === "function") {
+    return createImageBitmap(blob).then((bitmap) => ({
+      source: bitmap,
+      width: bitmap.width,
+      height: bitmap.height,
+      close: () => bitmap.close(),
+    }));
+  }
+
+  return new Promise((resolve, reject) => {
+    const objectUrl = URL.createObjectURL(blob);
     const image = new Image();
-    image.onload = () => resolve(image);
-    image.onerror = () => reject(new Error("The image could not be loaded."));
-    image.src = dataUrl;
+    image.onload = () =>
+      resolve({
+        source: image,
+        width: image.naturalWidth,
+        height: image.naturalHeight,
+        close: () => URL.revokeObjectURL(objectUrl),
+      });
+    image.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      reject(new Error("The image could not be loaded."));
+    };
+    image.src = objectUrl;
   });
+}
+
+async function decodeValidatedImage(validated: ValidatedImage) {
+  const decoded = await decodeImageBlob(validated.blob);
+  if (decoded.width !== validated.width || decoded.height !== validated.height) {
+    decoded.close();
+    throw new Error("The decoded image dimensions do not match its header.");
+  }
+  return decoded;
 }
 
 function drawImageContained(
   canvas: HTMLCanvasElement,
-  image: HTMLImageElement,
+  image: CanvasImageSource,
+  imageWidth: number,
+  imageHeight: number,
 ) {
   const context = getContext(canvas);
   if (!context) return;
 
   context.clearRect(0, 0, canvas.width, canvas.height);
   const scale = Math.min(
-    canvas.width / Math.max(image.naturalWidth, 1),
-    canvas.height / Math.max(image.naturalHeight, 1),
+    canvas.width / Math.max(imageWidth, 1),
+    canvas.height / Math.max(imageHeight, 1),
   );
-  const drawWidth = image.naturalWidth * scale;
-  const drawHeight = image.naturalHeight * scale;
+  const drawWidth = imageWidth * scale;
+  const drawHeight = imageHeight * scale;
   context.drawImage(
     image,
     (canvas.width - drawWidth) / 2,
@@ -190,6 +249,40 @@ function drawImageContained(
     drawWidth,
     drawHeight,
   );
+}
+
+function getHistoryByteLimit() {
+  const memory = (navigator as Navigator & { deviceMemory?: number })
+    .deviceMemory;
+  const looksMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+  return looksMobile || (memory !== undefined && memory <= 4)
+    ? MOBILE_HISTORY_BYTES
+    : DESKTOP_HISTORY_BYTES;
+}
+
+function snapshotCanvasLayer(canvas: HTMLCanvasElement) {
+  const encoded = canvas.toDataURL("image/webp", HISTORY_WEBP_QUALITY);
+  return dataUrlToBlob(encoded, DESKTOP_HISTORY_BYTES);
+}
+
+function createCompositeCanvas(
+  layer: HTMLCanvasElement,
+  backgroundColor: string,
+  maxDimension?: number,
+) {
+  const requestedMax = maxDimension
+    ? clamp(Math.floor(maxDimension), 320, 8192)
+    : Math.max(layer.width, layer.height);
+  const scale = Math.min(1, requestedMax / Math.max(layer.width, layer.height));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(layer.width * scale));
+  canvas.height = Math.max(1, Math.round(layer.height * scale));
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("The drawing could not be exported.");
+  context.fillStyle = backgroundColor;
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.drawImage(layer, 0, 0, canvas.width, canvas.height);
+  return canvas;
 }
 
 function hexToRgba(hex: string): [number, number, number, number] {
@@ -448,13 +541,121 @@ export const DrawingCanvas = forwardRef<
     [],
   );
 
+  const exportCompressed = useCallback(
+    async (
+      options: DrawingExportOptions = {},
+    ): Promise<DrawingExportResult> => {
+      const layer = canvasRef.current;
+      if (!layer) throw new Error("The drawing canvas is not ready.");
+
+      const requestedType = options.type ?? "image/webp";
+      const initialQuality = clamp(options.quality ?? 0.86, 0.1, 1);
+      const minQuality = clamp(
+        options.minQuality ?? 0.42,
+        0.1,
+        initialQuality,
+      );
+      const maxBytes = options.maxBytes
+        ? Math.max(1024, Math.floor(options.maxBytes))
+        : undefined;
+      let workingCanvas = createCompositeCanvas(
+        layer,
+        backgroundRef.current,
+        options.maxDimension,
+      );
+      let quality = initialQuality;
+      let blob = await canvasToBlob(workingCanvas, requestedType, quality);
+      let actualType = blob.type as DrawingImageType;
+
+      // Some older browsers silently return PNG when WebP is requested. PNG has
+      // no useful quality control, so JPEG is the predictable compressed fallback.
+      if (actualType !== requestedType) {
+        blob = await canvasToBlob(workingCanvas, "image/jpeg", quality);
+        actualType = blob.type as DrawingImageType;
+      }
+
+      if (maxBytes && blob.size > maxBytes) {
+        let low = minQuality;
+        let high = initialQuality;
+        let smallest = blob;
+        let smallestQuality = quality;
+        let bestWithinLimit: Blob | null = null;
+        let bestWithinQuality = minQuality;
+        for (let attempt = 0; attempt < 6; attempt += 1) {
+          quality = attempt === 0 ? minQuality : (low + high) / 2;
+          const candidate = await canvasToBlob(
+            workingCanvas,
+            actualType === "image/webp" ? "image/webp" : "image/jpeg",
+            quality,
+          );
+          if (candidate.size < smallest.size) {
+            smallest = candidate;
+            smallestQuality = quality;
+          }
+          if (candidate.size <= maxBytes) {
+            bestWithinLimit = candidate;
+            bestWithinQuality = quality;
+            low = quality;
+          } else {
+            high = quality;
+          }
+        }
+        if (bestWithinLimit) {
+          blob = bestWithinLimit;
+          quality = bestWithinQuality;
+        } else {
+          blob = smallest;
+          quality = smallestQuality;
+        }
+      }
+
+      if (
+        maxBytes &&
+        blob.size > maxBytes &&
+        options.allowResize !== false
+      ) {
+        while (
+          blob.size > maxBytes &&
+          Math.max(workingCanvas.width, workingCanvas.height) > 480
+        ) {
+          const next = document.createElement("canvas");
+          next.width = Math.max(1, Math.round(workingCanvas.width * 0.82));
+          next.height = Math.max(1, Math.round(workingCanvas.height * 0.82));
+          const context = next.getContext("2d");
+          if (!context) break;
+          context.drawImage(workingCanvas, 0, 0, next.width, next.height);
+          workingCanvas = next;
+          quality = minQuality;
+          blob = await canvasToBlob(
+            workingCanvas,
+            actualType === "image/webp" ? "image/webp" : "image/jpeg",
+            quality,
+          );
+        }
+      }
+
+      actualType = blob.type as DrawingImageType;
+      return {
+        dataUrl: await blobToDataUrl(blob),
+        blob,
+        type: actualType,
+        quality,
+        bytes: blob.size,
+        width: workingCanvas.width,
+        height: workingCanvas.height,
+        withinLimit: maxBytes === undefined || blob.size <= maxBytes,
+      };
+    },
+    [],
+  );
+
   const pushHistory = useCallback(
     (nextBackground = backgroundRef.current, emitChange = true) => {
       const canvas = canvasRef.current;
       if (!canvas) return;
 
       const entry: HistoryEntry = {
-        contentDataUrl: canvas.toDataURL("image/png"),
+        contentBlob: snapshotCanvasLayer(canvas),
         backgroundColor: nextBackground,
       };
       const historyLimit = clamp(Math.floor(maxHistory), 2, 100);
@@ -466,6 +667,15 @@ export const DrawingCanvas = forwardRef<
       if (nextHistory.length > historyLimit) {
         nextHistory = nextHistory.slice(nextHistory.length - historyLimit);
       }
+      const historyByteLimit = getHistoryByteLimit();
+      let retainedBytes = nextHistory.reduce(
+        (total, item) => total + item.contentBlob.size,
+        0,
+      );
+      while (nextHistory.length > 2 && retainedBytes > historyByteLimit) {
+        retainedBytes -= nextHistory[0].contentBlob.size;
+        nextHistory.shift();
+      }
 
       historyRef.current = nextHistory;
       historyIndexRef.current = nextHistory.length - 1;
@@ -476,7 +686,7 @@ export const DrawingCanvas = forwardRef<
 
       if (emitChange) {
         onChangeRef.current?.(
-          exportDataUrl("image/png", undefined, nextBackground),
+          exportDataUrl("image/webp", CHANGE_WEBP_QUALITY, nextBackground),
         );
       }
     },
@@ -498,22 +708,39 @@ export const DrawingCanvas = forwardRef<
       const context = getContext(canvas);
       context?.clearRect(0, 0, canvas.width, canvas.height);
 
-      void decodeImage(entry.contentDataUrl).then((image) => {
-        if (generation !== restoreGenerationRef.current) return;
-        const currentCanvas = canvasRef.current;
-        if (!currentCanvas) return;
-        const currentContext = getContext(currentCanvas);
-        currentContext?.clearRect(
-          0,
-          0,
-          currentCanvas.width,
-          currentCanvas.height,
-        );
-        currentContext?.drawImage(image, 0, 0);
-        onChangeRef.current?.(
-          exportDataUrl("image/png", undefined, entry.backgroundColor),
-        );
-      });
+      void decodeImageBlob(entry.contentBlob)
+        .then((image) => {
+          if (generation !== restoreGenerationRef.current) {
+            image.close();
+            return;
+          }
+          const currentCanvas = canvasRef.current;
+          if (!currentCanvas) {
+            image.close();
+            return;
+          }
+          const currentContext = getContext(currentCanvas);
+          currentContext?.clearRect(
+            0,
+            0,
+            currentCanvas.width,
+            currentCanvas.height,
+          );
+          currentContext?.drawImage(image.source, 0, 0);
+          image.close();
+          onChangeRef.current?.(
+            exportDataUrl(
+              "image/webp",
+              CHANGE_WEBP_QUALITY,
+              entry.backgroundColor,
+            ),
+          );
+        })
+        .catch(() => {
+          if (generation === restoreGenerationRef.current) {
+            setStatus("That undo snapshot could not be restored");
+          }
+        });
     },
     [exportDataUrl],
   );
@@ -546,16 +773,121 @@ export const DrawingCanvas = forwardRef<
     setStatus("Canvas cleared");
   }, [disabled, pushHistory]);
 
-  const loadDataUrl = useCallback(
-    async (dataUrl: string) => {
+  const loadBlob = useCallback(
+    async (blob: Blob) => {
       const generation = ++loadGenerationRef.current;
-      const image = await decodeImage(dataUrl);
+      ++restoreGenerationRef.current;
+      const validated = await validateImageBlob(blob);
       if (generation !== loadGenerationRef.current) return;
+      const image = await decodeValidatedImage(validated);
+      if (generation !== loadGenerationRef.current) {
+        image.close();
+        return;
+      }
       const canvas = canvasRef.current;
-      if (!canvas) return;
-      drawImageContained(canvas, image);
+      if (!canvas) {
+        image.close();
+        return;
+      }
+      drawImageContained(canvas, image.source, image.width, image.height);
+      image.close();
       pushHistory();
       setStatus("Image loaded");
+    },
+    [pushHistory],
+  );
+
+  const loadDataUrl = useCallback(
+    async (dataUrl: string) => {
+      // The encoded length is rejected before base64 bytes are allocated.
+      await loadBlob(dataUrlToBlob(dataUrl));
+    },
+    [loadBlob],
+  );
+
+  const saveDraft = useCallback(async (): Promise<DrawingCanvasDraft> => {
+    const canvas = canvasRef.current;
+    if (!canvas) throw new Error("The drawing canvas is not ready.");
+    let blob = await canvasToBlob(
+      canvas,
+      "image/webp",
+      DRAFT_WEBP_QUALITY,
+    );
+    if (blob.type !== "image/webp") {
+      blob = await canvasToBlob(canvas, "image/png");
+    }
+    return {
+      version: 1,
+      width: canvas.width,
+      height: canvas.height,
+      backgroundColor: backgroundRef.current,
+      layerDataUrl: await blobToDataUrl(blob),
+      layerBytes: blob.size,
+    };
+  }, []);
+
+  const loadDraft = useCallback(
+    async (draftValue: DrawingCanvasDraft | string) => {
+      let draft: DrawingCanvasDraft;
+      try {
+        draft =
+          typeof draftValue === "string"
+            ? (JSON.parse(draftValue) as DrawingCanvasDraft)
+            : draftValue;
+      } catch {
+        throw new Error("The saved drawing draft is malformed.");
+      }
+      if (
+        !draft ||
+        draft.version !== 1 ||
+        !Number.isInteger(draft.width) ||
+        !Number.isInteger(draft.height) ||
+        draft.width <= 0 ||
+        draft.height <= 0 ||
+        !/^#[0-9a-f]{6}$/i.test(draft.backgroundColor) ||
+        typeof draft.layerDataUrl !== "string"
+      ) {
+        throw new Error("The saved drawing draft is invalid.");
+      }
+
+      const generation = ++loadGenerationRef.current;
+      ++restoreGenerationRef.current;
+      const blob = dataUrlToBlob(draft.layerDataUrl);
+      if (
+        Number.isFinite(draft.layerBytes) &&
+        draft.layerBytes > 0 &&
+        draft.layerBytes !== blob.size
+      ) {
+        throw new Error("The saved drawing draft is incomplete.");
+      }
+      const validated = await validateImageBlob(blob);
+      if (
+        validated.width !== draft.width ||
+        validated.height !== draft.height
+      ) {
+        throw new Error("The saved drawing draft dimensions do not match.");
+      }
+      if (generation !== loadGenerationRef.current) return;
+      const image = await decodeValidatedImage(validated);
+      if (generation !== loadGenerationRef.current) {
+        image.close();
+        return;
+      }
+      const canvas = canvasRef.current;
+      if (!canvas) {
+        image.close();
+        return;
+      }
+
+      drawImageContained(canvas, image.source, image.width, image.height);
+      image.close();
+      historyRef.current = [];
+      historyIndexRef.current = -1;
+      backgroundRef.current = draft.backgroundColor;
+      setBackgroundColor(draft.backgroundColor);
+      setHistoryState({ index: -1, length: 0 });
+      pushHistory(draft.backgroundColor);
+      setStatus("Drawing draft restored");
     },
     [pushHistory],
   );
@@ -582,6 +914,9 @@ export const DrawingCanvas = forwardRef<
     forwardedRef,
     () => ({
       exportDataUrl: (type, quality) => exportDataUrl(type, quality),
+      exportCompressed,
+      saveDraft,
+      loadDraft,
       loadDataUrl,
       clear: clearCanvas,
       undo,
@@ -589,7 +924,17 @@ export const DrawingCanvas = forwardRef<
       fit,
       getCanvasElement: () => canvasRef.current,
     }),
-    [clearCanvas, exportDataUrl, fit, loadDataUrl, redo, undo],
+    [
+      clearCanvas,
+      exportCompressed,
+      exportDataUrl,
+      fit,
+      loadDataUrl,
+      loadDraft,
+      redo,
+      saveDraft,
+      undo,
+    ],
   );
 
   useEffect(() => {
@@ -611,15 +956,30 @@ export const DrawingCanvas = forwardRef<
       return;
     }
 
-    void decodeImage(initialImageDataUrl)
+    let decodedImage: DecodedImage | null = null;
+    void Promise.resolve()
+      .then(() => dataUrlToBlob(initialImageDataUrl))
+      .then((blob) => validateImageBlob(blob))
+      .then((validated) => decodeValidatedImage(validated))
       .then((image) => {
+        decodedImage = image;
         if (generation !== loadGenerationRef.current || !canvasRef.current) {
+          image.close();
+          decodedImage = null;
           return;
         }
-        drawImageContained(canvasRef.current, image);
+        drawImageContained(
+          canvasRef.current,
+          image.source,
+          image.width,
+          image.height,
+        );
+        image.close();
+        decodedImage = null;
         pushHistory(initialBackgroundColor, false);
       })
       .catch(() => {
+        decodedImage?.close();
         if (generation !== loadGenerationRef.current) return;
         setStatus("The starting image could not be loaded");
         pushHistory(initialBackgroundColor, false);
@@ -931,17 +1291,17 @@ export const DrawingCanvas = forwardRef<
       event.target.value = "";
       if (!file) return;
 
-      const reader = new FileReader();
-      reader.onload = () => {
-        if (typeof reader.result !== "string") return;
-        void loadDataUrl(reader.result).catch(() => {
-          setStatus("That image could not be opened");
-        });
-      };
-      reader.onerror = () => setStatus("That image could not be opened");
-      reader.readAsDataURL(file);
+      // Size, MIME signature, dimensions, and pixel count are checked before
+      // createImageBitmap/Image is allowed to decode the file.
+      void loadBlob(file).catch((error: unknown) => {
+        setStatus(
+          error instanceof Error
+            ? error.message
+            : "That image could not be opened",
+        );
+      });
     },
-    [loadDataUrl],
+    [loadBlob],
   );
 
   const handleExport = useCallback(() => {

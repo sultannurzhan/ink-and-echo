@@ -174,6 +174,31 @@ select:focus-visible {
   gap: 12px;
 }
 
+.leave-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 42px;
+  padding: 0 14px;
+  border: 1px solid rgba(222, 86, 78, 0.34);
+  border-radius: 12px;
+  color: var(--coral-dark);
+  background: rgba(255, 253, 248, 0.68);
+  font-size: 12px;
+  font-weight: 850;
+  transition: border-color 0.18s ease, background 0.18s ease, transform 0.18s ease;
+}
+
+.leave-button:hover:not(:disabled) {
+  border-color: var(--coral-dark);
+  background: #fff0ed;
+  transform: translateY(-1px);
+}
+
+.leave-button:active:not(:disabled) {
+  transform: translateY(0);
+}
+
 .quiet-button,
 .back-button,
 .demo-link {
@@ -401,6 +426,93 @@ select:focus-visible {
 
 .demo-link:hover {
   color: var(--violet);
+}
+
+.recent-rooms {
+  display: grid;
+  gap: 10px;
+  width: min(590px, 100%);
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px dashed rgba(46, 49, 80, 0.18);
+}
+
+.recent-rooms > h2,
+.recent-rooms > strong {
+  margin: 0 0 2px;
+  font-family: var(--display);
+  font-size: 14px;
+  letter-spacing: -0.2px;
+}
+
+.recent-rooms > p {
+  margin: -5px 0 3px;
+  color: var(--ink-soft);
+  font-size: 11px;
+}
+
+.recent-room-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+  min-height: 64px;
+  padding: 10px 11px 10px 15px;
+  border: 1px solid rgba(46, 49, 80, 0.13);
+  border-radius: 14px;
+  background: rgba(255, 253, 248, 0.78);
+  box-shadow: 0 3px 0 rgba(46, 49, 80, 0.05);
+}
+
+.recent-room-card > div:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.recent-room-card strong {
+  overflow: hidden;
+  font-family: var(--display);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recent-room-card small {
+  overflow: hidden;
+  color: var(--ink-soft);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recent-room-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.recent-room-actions button,
+.recent-room-actions a {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 40px;
+  padding: 0 12px;
+  border: 1px solid rgba(46, 49, 80, 0.18);
+  border-radius: 10px;
+  color: var(--ink);
+  background: white;
+  font-size: 11px;
+  font-weight: 850;
+  text-decoration: none;
+}
+
+.recent-room-actions button:hover:not(:disabled),
+.recent-room-actions a:hover {
+  border-color: var(--violet);
+  color: var(--violet);
+  background: #f5f2ff;
 }
 
 .hero-art {
@@ -750,6 +862,7 @@ select:focus-visible {
 }
 
 .promise-inner span:last-child { border-right: 0; }
+.privacy-note { max-width: 860px; padding: 17px 0 28px; color: var(--ink-soft); font-size: 12px; text-align: center; }
 .promise-inner b { color: var(--coral); font-family: Georgia, serif; font-size: 20px; }
 
 .toast {
@@ -791,6 +904,55 @@ select:focus-visible {
   border: 0;
   background: transparent;
   font-size: 22px;
+}
+
+.status-banner {
+  position: relative;
+  z-index: 25;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: min(1180px, calc(100% - 48px));
+  min-height: 42px;
+  margin: -4px auto 12px;
+  padding: 9px 14px;
+  border: 1px solid rgba(46, 49, 80, 0.16);
+  border-radius: 13px;
+  color: var(--ink-soft);
+  background: rgba(255, 253, 248, 0.92);
+  box-shadow: 0 6px 18px rgba(51, 43, 79, 0.06);
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.status-banner::before {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: currentColor;
+  content: "";
+}
+
+.status-banner.reconnecting {
+  border-color: rgba(75, 147, 191, 0.35);
+  color: #286987;
+  background: #edf7fb;
+}
+
+.status-banner.reconnecting::before {
+  box-shadow: 0 0 0 0 rgba(75, 147, 191, 0.34);
+  animation: reconnect-pulse 1.5s ease-out infinite;
+}
+
+.status-banner.storage {
+  border-color: rgba(170, 127, 22, 0.34);
+  color: #765813;
+  background: #fff8db;
+}
+
+@keyframes reconnect-pulse {
+  70% { box-shadow: 0 0 0 7px rgba(75, 147, 191, 0); }
 }
 
 .back-button {
@@ -1253,6 +1415,23 @@ select:focus-visible {
 .seat strong { font-family: var(--display); font-size: 15px; }
 .seat > i { margin-left: auto; padding: 4px 9px; border-radius: 99px; color: #39795b; background: #dcefe4; font-size: 9px; font-style: normal; font-weight: 900; text-transform: uppercase; }
 
+.presence-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  flex: 0 0 auto;
+  border: 2px solid rgba(255, 253, 248, 0.95);
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 0 1px rgba(57, 121, 91, 0.28);
+  vertical-align: middle;
+}
+
+.presence-dot.offline {
+  background: #aaa69e;
+  box-shadow: 0 0 0 1px rgba(93, 96, 121, 0.22);
+}
+
 .waiting-note {
   display: inline-flex;
   align-items: center;
@@ -1498,6 +1677,22 @@ select:focus-visible {
 }
 .partner-wait h1 { margin: 12px 0 18px; font-size: 46px; }
 .partner-wait > p { max-width: 510px; margin: 0 auto 25px; color: var(--ink-soft); }
+.clue-composer {
+  display: flex;
+  align-items: end;
+  gap: 10px;
+  max-width: 520px;
+  margin: 0 auto 22px;
+  padding: 14px;
+  border: 1px dashed rgba(116, 103, 216, 0.45);
+  border-radius: 16px;
+  background: #f5f2ff;
+  text-align: left;
+}
+.clue-composer label { display: grid; flex: 1; gap: 6px; }
+.clue-composer label > span { color: var(--violet); font-size: 11px; font-weight: 850; text-transform: uppercase; letter-spacing: 1px; }
+.clue-composer input { width: 100%; min-height: 44px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 11px; background: white; }
+.clue-composer .secondary-button { min-height: 44px; }
 .thinking-doodle { display: flex; justify-content: center; gap: 7px; height: 45px; }
 .thinking-doodle i { width: 13px; height: 13px; border-radius: 50%; background: var(--violet); animation: dots 1s infinite alternate; }
 .thinking-doodle i:nth-child(2) { animation-delay: 0.2s; }
@@ -1607,6 +1802,64 @@ select:focus-visible {
 .how-modal li:nth-child(even) > span { background: var(--coral); }
 .how-modal li strong { font-family: var(--display); }
 .how-modal li p { margin: 3px 0 0; color: var(--ink-soft); font-size: 12px; }
+
+.leave-modal {
+  position: relative;
+  width: min(460px, 100%);
+  padding: 34px;
+  border: 1px solid rgba(46, 49, 80, 0.12);
+  border-radius: 22px;
+  background: var(--paper);
+  box-shadow: 0 35px 90px rgba(25, 22, 45, 0.3);
+  animation: modal-in 0.25s ease;
+}
+
+.leave-modal h2,
+.leave-modal h3 {
+  margin: 0 0 9px;
+  font-family: var(--display);
+  font-size: 28px;
+  letter-spacing: -0.8px;
+}
+
+.leave-modal p {
+  margin: 0 0 24px;
+  color: var(--ink-soft);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.leave-modal > div:last-child {
+  display: flex;
+  justify-content: flex-end;
+  gap: 9px;
+}
+
+.danger-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 48px;
+  padding: 0 20px;
+  border: 2px solid var(--ink);
+  border-radius: 13px;
+  color: white;
+  background: var(--coral-dark);
+  box-shadow: 3px 4px 0 var(--ink);
+  font-weight: 850;
+  transition: background 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
+}
+
+.danger-button:hover:not(:disabled) {
+  background: #c94640;
+  box-shadow: 1px 2px 0 var(--ink);
+  transform: translate(2px, 2px);
+}
+
+.danger-button:active:not(:disabled) {
+  box-shadow: none;
+  transform: translate(3px, 4px);
+}
 
 /* Drawing desk */
 .drawing-canvas-root,
@@ -1864,6 +2117,26 @@ select:focus-visible {
   text-align: right;
 }
 
+.draft-note {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  margin: 6px 0 0;
+  color: var(--ink-soft);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.draft-note::before {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--green);
+  content: "";
+}
+
 .drawing-canvas__confirm-backdrop {
   position: fixed;
   inset: 0;
@@ -1985,6 +2258,7 @@ select:focus-visible {
 @media (max-width: 860px) {
   .page-width,
   .site-header { width: min(100% - 32px, 680px); }
+  .status-banner { width: min(100% - 32px, 680px); }
   .hero { display: block; padding-top: 36px; }
   .hero-copy { margin: 0 auto; }
   .hero-art { width: min(520px, 100%); margin: 45px auto -15px; transform: none; }
@@ -2019,13 +2293,21 @@ select:focus-visible {
   .site-header { min-height: 72px; }
   .brand { font-size: 19px; }
   .brand-mark { width: 34px; height: 34px; }
+  .header-actions { gap: 6px; }
   .quiet-button { font-size: 12px; }
+  .leave-button { min-width: 44px; min-height: 44px; padding-inline: 10px; }
   .mini-room { display: none; }
+  .status-banner { align-items: flex-start; margin-top: 0; padding: 10px 12px; line-height: 1.45; }
   .hero { min-height: auto; padding-top: 30px; }
   .hero h1 { font-size: clamp(46px, 14vw, 62px); letter-spacing: -2.8px; }
   .hero-copy > p { font-size: 16px; }
   .hero-actions { display: grid; }
   .hero-actions .big { width: 100%; }
+  .recent-rooms { margin-top: 20px; }
+  .recent-room-card { grid-template-columns: 1fr; gap: 9px; padding: 13px; }
+  .recent-room-actions { width: 100%; }
+  .recent-room-actions button,
+  .recent-room-actions a { flex: 1; min-height: 44px; }
   .hero-art { height: 480px; margin-top: 24px; transform: scale(0.84); transform-origin: top center; }
   .prompt-paper { left: 16px; }
   .drawing-paper { right: 4px; }
@@ -2067,6 +2349,8 @@ select:focus-visible {
   .drawing-submit-row .secondary-button { width: 100%; }
   .partner-wait { margin-top: 45px; padding: 35px 21px; }
   .partner-wait h1 { font-size: 37px; }
+  .clue-composer { align-items: stretch; flex-direction: column; }
+  .clue-composer .secondary-button { width: 100%; min-height: 48px; }
   .gallery-hero h1 { font-size: 52px; }
   .gallery-entry { grid-template-columns: 1fr; gap: 12px; }
   .gallery-meta { min-height: 74px; }
@@ -2076,6 +2360,9 @@ select:focus-visible {
   .gallery-rule { grid-column: 1; }
   .gallery-footer { align-items: stretch; flex-direction: column; text-align: center; }
   .how-modal { padding: 31px 20px 22px; }
+  .leave-modal { padding: 29px 20px 22px; }
+  .leave-modal > div:last-child { align-items: stretch; flex-direction: column-reverse; }
+  .leave-modal > div:last-child button { width: 100%; min-height: 48px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

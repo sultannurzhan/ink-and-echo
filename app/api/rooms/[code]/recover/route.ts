@@ -1,5 +1,5 @@
 import { jsonResponse, readJsonObject, roomErrorResponse } from "@/lib/server/room-http";
-import { enforceRoomRateLimit, joinRoom } from "@/lib/server/room-service";
+import { enforceRoomRateLimit, recoverRoomSession } from "@/lib/server/room-service";
 
 interface RouteContext {
   params: Promise<{ code: string }>;
@@ -8,13 +8,14 @@ interface RouteContext {
 export async function POST(request: Request, context: RouteContext) {
   try {
     const { code } = await context.params;
-    await enforceRoomRateLimit(request, "join", code.toUpperCase());
+    await enforceRoomRateLimit(request, "recover", code.toUpperCase());
     const body = await readJsonObject(request);
-    const result = await joinRoom(code, {
-      name: body.name,
-      playerName: body.playerName,
+    const result = await recoverRoomSession(code, {
+      playerId: body.playerId,
+      recoverySecret: body.recoverySecret,
+      recoveryToken: body.recoveryToken,
     });
-    return jsonResponse(result, { status: 201 });
+    return jsonResponse(result);
   } catch (error) {
     return roomErrorResponse(error);
   }

@@ -1,8 +1,9 @@
 import { jsonResponse, readJsonObject, roomErrorResponse } from "@/lib/server/room-http";
-import { createRoom } from "@/lib/server/room-service";
+import { createRoom, enforceRoomRateLimit } from "@/lib/server/room-service";
 
 export async function POST(request: Request) {
   try {
+    await enforceRoomRateLimit(request, "create");
     const body = await readJsonObject(request);
     const result = await createRoom({
       name: body.name,
