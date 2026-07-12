@@ -1,8 +1,36 @@
 "use client";
 /* eslint-disable @next/next/no-img-element -- Player-created data URLs cannot use Next image optimization. */
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { DrawingCanvas, type DrawingCanvasHandle } from "@/components/DrawingCanvas";
+import {
+  isConfirmedInvalidAuth,
+  pollingDelay,
+  readRoomJson,
+  roomAuthHeaders,
+  RoomApiError,
+  shouldApplyRoomVersion,
+} from "@/lib/client/room-transport";
+import {
+  listRecoverySessions,
+  makeResumeUrl,
+  pruneRecoverySessions,
+  readActiveCredentials,
+  readLegacyCredentials,
+  readRecoverySession,
+  removeActiveCredentials,
+  removeLegacyCredentials,
+  removeRoomSession,
+  saveActiveCredentials,
+  saveRecoverySession,
+  type StoredRoomSession,
+} from "@/lib/client/room-session";
+import {
+  deleteTurnDraft,
+  readTurnDraft,
+  saveTurnDraft,
+  turnDraftKey,
+} from "@/lib/client/draft-store";
 
 type View = "landing" | "create" | "join" | "lobby" | "game" | "gallery";
 type ModeId =
@@ -22,7 +50,13 @@ type Settings = {
   canvasSize: "square" | "classic" | "wide";
 };
 
-type Player = { id: string; name: string; isHost?: boolean };
+type Player = {
+  id: string;
+  name: string;
+  isHost?: boolean;
+  isOnline?: boolean;
+  lastSeenAt?: number;
+};
 type GalleryEntry = {
   id?: string;
   round: number;
@@ -46,6 +80,8 @@ type CurrentTurn = {
   duoBeat?: string;
   deadlineAt?: number;
   revealUntil?: number;
+  sourceEntryId?: string | null;
+  canAddClue?: boolean;
 };
 type Room = {
   code: string;
@@ -55,12 +91,22 @@ type Room = {
   activePlayerId?: string;
   turnIndex?: number;
   totalTurns?: number;
+  turnNumber?: number;
+  presenceVersion?: number;
+  serverNow?: number;
+  expiresAt?: number;
   settings: Settings;
   players: Player[];
   currentTurn?: CurrentTurn | null;
   gallery?: GalleryEntry[];
 };
-type Session = { room: Room; playerId: string; playerToken: string };
+type Session = {
+  room: Room;
+  playerId: string;
+  playerToken: string;
+  recoveryToken?: string;
+  playerName?: string;
+};
 
 const MODES: Array<{
   id: ModeId;
@@ -154,19 +200,18 @@ const DEMO_PROMPTS = [
   "A ghost trying to take a group photo",
 ];
 
-const ROOM_SESSION_PREFIX = "ink-and-echo:room:";
+const DEMO_REMIX_RULES = [
+  "Make it dramatic",
+  "Turn one detail into a monster",
+  "Add something suspicious",
+  "Make it unexpectedly fancy",
+];
+
+const DEMO_EMPTY_DRAWING = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAF/gL+Avz6WQAAAABJRU5ErkJggg==";
 
 function normalizeRoom(value: unknown): Room {
   const body = value as { room?: Room } & Room;
   return body.room ?? body;
-}
-
-async function readJson(response: Response) {
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw new Error((body as { error?: string }).error || "Something went sideways. Please try again.");
-  }
-  return body as Record<string, unknown>;
 }
 
 function modeById(id: ModeId) {
@@ -182,27 +227,40 @@ function makeInviteUrl(code: string) {
   return `${window.location.origin}${window.location.pathname}?room=${code}`;
 }
 
-function rememberRoomSession(session: Session) {
-  if (typeof window === "undefined" || session.room.code === "DEMO") return;
-  window.localStorage.setItem(
-    `${ROOM_SESSION_PREFIX}${session.room.code}`,
-    JSON.stringify({
-      code: session.room.code,
-      playerId: session.playerId,
-      playerToken: session.playerToken,
-    }),
-  );
-}
-
-function forgetRoomSession(code?: string) {
-  if (typeof window === "undefined" || !code || code === "DEMO") return;
-  window.localStorage.removeItem(`${ROOM_SESSION_PREFIX}${code}`);
-}
-
 function viewForRoom(room: Room): View {
   if (room.phase === "playing") return "game";
   if (room.phase === "gallery" || room.phase === "finished") return "gallery";
   return "lobby";
+}
+
+function persistRoomSession(session: Session) {
+  if (typeof window === "undefined" || session.room.code === "DEMO") return true;
+  const activeSaved = saveActiveCredentials(window.sessionStorage, session.room.code, {
+    playerId: session.playerId,
+    playerToken: session.playerToken,
+  });
+  const recoverySaved = session.recoveryToken
+    ? saveRecoverySession(window.localStorage, {
+        code: session.room.code,
+        playerId: session.playerId,
+        recoveryToken: session.recoveryToken,
+        playerName: session.playerName,
+        phase: session.room.phase,
+        updatedAt: Date.now(),
+      })
+    : true;
+  return activeSaved && recoverySaved;
+}
+
+function roomTurnSignature(room: Room) {
+  const turn = room.currentTurn;
+  return [
+    room.turnNumber ?? room.turnIndex ?? 0,
+    turn?.round ?? 0,
+    turn?.kind ?? "waiting",
+    turn?.playerId ?? room.activePlayerId ?? "none",
+    turn?.sourceEntryId ?? "seed",
+  ].join(":");
 }
 
 export function GameApp() {
@@ -213,91 +271,289 @@ export function GameApp() {
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [reconnecting, setReconnecting] = useState(false);
+  const [storageWarning, setStorageWarning] = useState(false);
+  const [recentRooms, setRecentRooms] = useState<StoredRoomSession[]>([]);
+  const [confirmLeave, setConfirmLeave] = useState(false);
   const [copied, setCopied] = useState(false);
   const [showHow, setShowHow] = useState(false);
   const pollFailureCount = useRef(0);
+  const sessionRef = useRef<Session | null>(null);
+  const wakePollRef = useRef<(() => void) | null>(null);
+  const broadcastRef = useRef<BroadcastChannel | null>(null);
+  const tabIdRef = useRef("");
 
   const room = session?.room;
+  const roomCode = room?.code;
+  const roomPhase = room?.phase;
   const selectedMode = modeById(settings.mode);
+
+  useEffect(() => {
+    sessionRef.current = session;
+  }, [session]);
+
+  const acceptSession = useCallback((next: Session) => {
+    sessionRef.current = next;
+    setSession(next);
+    setView(viewForRoom(next.room));
+    setReconnecting(false);
+    setError("");
+    const saved = persistRoomSession(next);
+    setStorageWarning(!saved);
+    if (typeof window !== "undefined") {
+      if (next.recoveryToken) removeLegacyCredentials(window.localStorage, next.room.code);
+      setRecentRooms(listRecoverySessions(window.localStorage));
+      window.history.replaceState({}, "", `?room=${next.room.code}`);
+    }
+  }, []);
+
+  const resumeRoom = useCallback(async (
+    code: string,
+    override?: { playerId: string; recoveryToken: string },
+  ) => {
+    const normalizedCode = code.toUpperCase();
+    setLoading(true);
+    setError("");
+    const savedRecovery = readRecoverySession(window.localStorage, normalizedCode);
+    const recovery = override ?? (savedRecovery?.recoveryToken
+      ? { playerId: savedRecovery.playerId, recoveryToken: savedRecovery.recoveryToken }
+      : undefined);
+    const active = override
+      ? undefined
+      : readActiveCredentials(window.sessionStorage, normalizedCode)
+        ?? readLegacyCredentials(window.localStorage, normalizedCode);
+
+    if (active) {
+      try {
+        const response = await fetch(`/api/rooms/${normalizedCode}`, {
+          cache: "no-store",
+          headers: roomAuthHeaders(active),
+        });
+        const body = await readRoomJson(response);
+        acceptSession({
+          room: normalizeRoom(body),
+          playerId: active.playerId,
+          playerToken: active.playerToken,
+          recoveryToken: typeof body.recoveryToken === "string"
+            ? body.recoveryToken
+            : recovery?.recoveryToken,
+          playerName: savedRecovery?.playerName,
+        });
+        setLoading(false);
+        return true;
+      } catch (cause) {
+        if (!isConfirmedInvalidAuth(cause)) {
+          setLoading(false);
+          setReconnecting(true);
+          setError("We could not reconnect yet. Your saved seat is safe — try again when the connection settles.");
+          return false;
+        }
+        removeActiveCredentials(window.sessionStorage, normalizedCode);
+      }
+    }
+
+    if (recovery) {
+      try {
+        const response = await fetch(`/api/rooms/${normalizedCode}/recover`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(recovery),
+        });
+        const body = await readRoomJson(response);
+        const next: Session = {
+          room: normalizeRoom(body),
+          playerId: String(body.playerId ?? recovery.playerId),
+          playerToken: String(body.playerToken),
+          recoveryToken: String(body.recoveryToken ?? recovery.recoveryToken),
+          playerName: typeof body.player === "object" && body.player
+            ? String((body.player as { name?: string }).name ?? savedRecovery?.playerName ?? "")
+            : savedRecovery?.playerName,
+        };
+        acceptSession(next);
+        setLoading(false);
+        return true;
+      } catch (cause) {
+        if (isConfirmedInvalidAuth(cause)) {
+          const latestRecovery = readRecoverySession(window.localStorage, normalizedCode);
+          const recoveryWasRotatedElsewhere = Boolean(
+            latestRecovery &&
+            (latestRecovery.playerId !== recovery.playerId ||
+              latestRecovery.recoveryToken !== recovery.recoveryToken),
+          );
+          if (override || recoveryWasRotatedElsewhere) {
+            setRecentRooms(listRecoverySessions(window.localStorage));
+            setError(
+              recoveryWasRotatedElsewhere
+                ? "Another tab refreshed this seat first. Its newer recovery key was kept safe — press Resume once more."
+                : "That private recovery link has expired. Any newer seat saved on this device was kept safe.",
+            );
+          } else {
+            removeRoomSession(window.localStorage, window.sessionStorage, normalizedCode);
+            setRecentRooms(listRecoverySessions(window.localStorage));
+            setError("That saved seat is no longer valid. You can still join an open seat with the room code.");
+          }
+        } else {
+          setReconnecting(true);
+          setError("The room is temporarily unreachable. Your recovery key was kept safely on this device.");
+        }
+        setLoading(false);
+        return false;
+      }
+    }
+
+    setLoading(false);
+    return false;
+  }, [acceptSession]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const code = params.get("room")?.toUpperCase();
-    if (!code) return;
+    pruneRecoverySessions(window.localStorage, 45 * 24 * 60 * 60 * 1000);
+    const refreshRecentRooms = window.setTimeout(() => {
+      setRecentRooms(listRecoverySessions(window.localStorage));
+    }, 0);
+    if (!code) return () => window.clearTimeout(refreshRecentRooms);
     let cancelled = false;
     const revealInvite = window.setTimeout(() => {
       void (async () => {
-        const fallbackToJoin = () => {
-          if (cancelled) return;
+        const hash = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+        const resumeValue = hash.get("resume");
+        const separator = resumeValue?.indexOf(".") ?? -1;
+        const override = resumeValue && separator > 0
+          ? {
+              playerId: resumeValue.slice(0, separator),
+              recoveryToken: resumeValue.slice(separator + 1),
+            }
+          : undefined;
+        const resumed = await resumeRoom(code, override);
+        if (cancelled || resumed) return;
+        const hasSavedRecovery = Boolean(readRecoverySession(window.localStorage, code));
+        if (!hasSavedRecovery) {
           setJoinCode(code);
           setView("join");
-          setLoading(false);
-        };
-        const saved = window.localStorage.getItem(`${ROOM_SESSION_PREFIX}${code}`);
-        if (!saved) {
-          fallbackToJoin();
-          return;
-        }
-        try {
-          const credentials = JSON.parse(saved) as { playerId?: string; playerToken?: string };
-          if (!credentials.playerId || !credentials.playerToken) throw new Error("Incomplete room session");
-          setLoading(true);
-          const query = new URLSearchParams({
-            playerId: credentials.playerId,
-            playerToken: credentials.playerToken,
-          });
-          const response = await fetch(`/api/rooms/${code}?${query}`, { cache: "no-store" });
-          const body = await readJson(response);
-          if (cancelled) return;
-          const restored: Session = {
-            room: normalizeRoom(body),
-            playerId: credentials.playerId,
-            playerToken: credentials.playerToken,
-          };
-          setSession(restored);
-          setView(viewForRoom(restored.room));
-          setLoading(false);
-        } catch {
-          forgetRoomSession(code);
-          fallbackToJoin();
         }
       })();
     }, 0);
     return () => {
       cancelled = true;
+      window.clearTimeout(refreshRecentRooms);
       window.clearTimeout(revealInvite);
     };
+  }, [resumeRoom]);
+
+  useEffect(() => {
+    if (!roomCode || roomCode === "DEMO") return;
+    const code = roomCode;
+    const channel = typeof BroadcastChannel === "undefined"
+      ? null
+      : new BroadcastChannel(`ink-and-echo:${code}`);
+    broadcastRef.current = channel;
+    channel?.addEventListener("message", () => wakePollRef.current?.());
+    return () => {
+      channel?.close();
+      if (broadcastRef.current === channel) broadcastRef.current = null;
+    };
+  }, [roomCode]);
+
+  const applyRoomSnapshot = useCallback((nextRoom: Room) => {
+    const current = sessionRef.current;
+    if (!current || current.room.code !== nextRoom.code) return false;
+    const newerGameState = shouldApplyRoomVersion(current.room.version, nextRoom.version);
+    const newerPresence =
+      nextRoom.version === current.room.version &&
+      Number.isFinite(nextRoom.presenceVersion) &&
+      nextRoom.presenceVersion !== current.room.presenceVersion;
+    if (!newerGameState && !newerPresence) return false;
+    const next = { ...current, room: nextRoom };
+    sessionRef.current = next;
+    setSession(next);
+    persistRoomSession(next);
+    setReconnecting(false);
+    pollFailureCount.current = 0;
+    if (nextRoom.phase === "playing") setView("game");
+    if (nextRoom.phase === "gallery" || nextRoom.phase === "finished") setView("gallery");
+    return true;
   }, []);
 
   useEffect(() => {
     if (
-      !session ||
-      session.room.code === "DEMO" ||
-      session.room.phase === "gallery" ||
-      session.room.phase === "finished"
+      !roomCode ||
+      roomCode === "DEMO" ||
+      roomPhase === "gallery" ||
+      roomPhase === "finished"
     ) return;
-    const interval = window.setInterval(async () => {
+    const code = roomCode;
+    let stopped = false;
+    let timer: number | undefined;
+    let controller: AbortController | null = null;
+
+    const schedule = (delay: number) => {
+      if (stopped) return;
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => void poll(), delay);
+    };
+
+    const poll = async () => {
+      if (stopped) return;
+      if (document.visibilityState === "hidden") {
+        schedule(4_000);
+        return;
+      }
+      const current = sessionRef.current;
+      if (!current || current.room.code !== code) return;
+      controller?.abort();
+      const requestController = new AbortController();
+      controller = requestController;
       try {
         const query = new URLSearchParams({
-          playerId: session.playerId,
-          playerToken: session.playerToken,
-          sinceVersion: String(session.room.version),
+          sinceVersion: String(current.room.version),
+          sincePresenceVersion: String(current.room.presenceVersion ?? 0),
         });
-        const response = await fetch(`/api/rooms/${session.room.code}?${query}`, { cache: "no-store" });
-        if (response.status === 304) return;
-        const body = await readJson(response);
-        const nextRoom = normalizeRoom(body);
-        setSession((current) => (current ? { ...current, room: nextRoom } : current));
+        const response = await fetch(`/api/rooms/${code}?${query}`, {
+          cache: "no-store",
+          headers: roomAuthHeaders(current),
+          signal: requestController.signal,
+        });
+        if (response.status !== 304) {
+          const body = await readRoomJson(response);
+          applyRoomSnapshot(normalizeRoom(body));
+        }
         pollFailureCount.current = 0;
-        if (nextRoom.phase === "playing") setView("game");
-        if (nextRoom.phase === "gallery" || nextRoom.phase === "finished") setView("gallery");
-      } catch {
+        setReconnecting(false);
+        schedule(900);
+      } catch (cause) {
+        if (requestController.signal.aborted || stopped) return;
+        if (isConfirmedInvalidAuth(cause)) {
+          const recovered = await resumeRoom(code);
+          if (!recovered) setReconnecting(true);
+          return;
+        }
         pollFailureCount.current += 1;
-        if (pollFailureCount.current > 4) setError("The room is taking a nap. Trying to reconnect…");
+        setReconnecting(true);
+        schedule(pollingDelay(pollFailureCount.current));
+      } finally {
+        if (controller === requestController) controller = null;
       }
-    }, 900);
-    return () => window.clearInterval(interval);
-  }, [session]);
+    };
+
+    wakePollRef.current = () => {
+      controller?.abort();
+      window.clearTimeout(timer);
+      void poll();
+    };
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") wakePollRef.current?.();
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
+    void poll();
+    return () => {
+      stopped = true;
+      controller?.abort();
+      window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", handleVisibility);
+      wakePollRef.current = null;
+    };
+  }, [applyRoomSnapshot, resumeRoom, roomCode, roomPhase]);
 
   async function createRoom() {
     if (!playerName.trim()) {
@@ -312,16 +568,15 @@ export function GameApp() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ playerName: playerName.trim(), settings }),
       });
-      const body = await readJson(response);
+      const body = await readRoomJson(response);
       const next: Session = {
         room: normalizeRoom(body),
         playerId: String(body.playerId),
         playerToken: String(body.playerToken),
+        recoveryToken: String(body.recoveryToken ?? "") || undefined,
+        playerName: playerName.trim(),
       };
-      setSession(next);
-      rememberRoomSession(next);
-      window.history.replaceState({}, "", `?room=${next.room.code}`);
-      setView("lobby");
+      acceptSession(next);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not make the room.");
     } finally {
@@ -347,16 +602,15 @@ export function GameApp() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ playerName: playerName.trim() }),
       });
-      const body = await readJson(response);
+      const body = await readRoomJson(response);
       const next: Session = {
         room: normalizeRoom(body),
         playerId: String(body.playerId),
         playerToken: String(body.playerToken),
+        recoveryToken: String(body.recoveryToken ?? "") || undefined,
+        playerName: playerName.trim(),
       };
-      setSession(next);
-      rememberRoomSession(next);
-      window.history.replaceState({}, "", `?room=${next.room.code}`);
-      setView(next.room.phase === "playing" ? "game" : "lobby");
+      acceptSession(next);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not join that room.");
     } finally {
@@ -397,47 +651,144 @@ export function GameApp() {
     await sendAction("start_game", {});
   }
 
-  async function sendAction(type: string, payload: Record<string, unknown>) {
-    if (!session) return;
-    if (session.room.code === "DEMO") return;
+  async function sendAction(type: string, payload: Record<string, unknown>): Promise<boolean> {
+    const current = sessionRef.current;
+    if (!current || current.room.code === "DEMO") return false;
+    const leaseKey = `ink-and-echo:action:${current.room.code}`;
+    const owner = tabIdRef.current || (tabIdRef.current = crypto.randomUUID());
+    try {
+      const existing = JSON.parse(window.localStorage.getItem(leaseKey) || "null") as {
+        owner?: string;
+        expiresAt?: number;
+      } | null;
+      if (existing?.owner && existing.owner !== owner && (existing.expiresAt ?? 0) > Date.now()) {
+        setError("This room is already submitting from another tab. We’ll refresh this one instead.");
+        wakePollRef.current?.();
+        return false;
+      }
+      window.localStorage.setItem(leaseKey, JSON.stringify({ owner, expiresAt: Date.now() + 15_000 }));
+    } catch {
+      // Version checks on the server still prevent duplicate commits when storage is unavailable.
+    }
     setLoading(true);
     setError("");
     try {
-      const response = await fetch(`/api/rooms/${session.room.code}/actions`, {
+      const response = await fetch(`/api/rooms/${current.room.code}/actions`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: roomAuthHeaders(current, true),
         body: JSON.stringify({
-          playerId: session.playerId,
-          playerToken: session.playerToken,
-          expectedVersion: session.room.version,
+          expectedVersion: current.room.version,
           action: { type, ...payload },
         }),
       });
-      const body = await readJson(response);
+      const body = await readRoomJson(response);
       const nextRoom = normalizeRoom(body);
-      setSession((current) => (current ? { ...current, room: nextRoom } : current));
-      if (nextRoom.phase === "playing") setView("game");
-      if (nextRoom.phase === "gallery" || nextRoom.phase === "finished") setView("gallery");
+      applyRoomSnapshot(nextRoom);
+      broadcastRef.current?.postMessage({ type: "refresh", version: nextRoom.version });
+      return true;
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "That turn did not arrive. Try once more.");
+      wakePollRef.current?.();
+      if (cause instanceof RoomApiError && cause.status === 409) {
+        setError("That turn already moved on. We’re loading the newest version now.");
+      } else {
+        setReconnecting(true);
+        setError("We could not confirm whether that turn arrived. Your draft is still saved while we check.");
+      }
+      return false;
     } finally {
       setLoading(false);
+      try {
+        const lease = JSON.parse(window.localStorage.getItem(leaseKey) || "null") as { owner?: string } | null;
+        if (lease?.owner === owner) window.localStorage.removeItem(leaseKey);
+      } catch {
+        // Lease expiry handles cleanup when storage reads fail.
+      }
     }
   }
 
-  function leaveRoom() {
-    forgetRoomSession(session?.room.code);
+  function returnHome() {
     setSession(null);
+    sessionRef.current = null;
     setView("landing");
     setError("");
     window.history.replaceState({}, "", window.location.pathname);
+  }
+
+  async function leaveRoom() {
+    const current = sessionRef.current;
+    if (!current) {
+      returnHome();
+      return;
+    }
+    if (current.room.code !== "DEMO") {
+      setLoading(true);
+      setError("");
+      try {
+        const response = await fetch(`/api/rooms/${current.room.code}/leave`, {
+          method: "POST",
+          headers: roomAuthHeaders(current),
+        });
+        await readRoomJson(response);
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : "We could not confirm that the room was left. Your recovery key is still saved.");
+        setConfirmLeave(false);
+        setLoading(false);
+        return;
+      }
+      removeRoomSession(window.localStorage, window.sessionStorage, current.room.code);
+      setRecentRooms(listRecoverySessions(window.localStorage));
+      setLoading(false);
+    }
+    setConfirmLeave(false);
+    returnHome();
+  }
+
+  async function deleteCurrentRoom() {
+    const current = sessionRef.current;
+    if (!current || current.room.code === "DEMO") {
+      returnHome();
+      return;
+    }
+    setLoading(true);
+    setError("");
+    try {
+      const response = await fetch(`/api/rooms/${current.room.code}`, {
+        method: "DELETE",
+        headers: roomAuthHeaders(current),
+      });
+      await readRoomJson(response);
+      removeRoomSession(window.localStorage, window.sessionStorage, current.room.code);
+      setRecentRooms(listRecoverySessions(window.localStorage));
+      returnHome();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "The room could not be deleted yet.");
+    } finally {
+      setLoading(false);
+    }
   }
 
   return (
     <main className="app-shell">
       <div className="ambient ambient-one" aria-hidden="true" />
       <div className="ambient ambient-two" aria-hidden="true" />
-      <Header roomCode={room?.code} onHome={leaveRoom} onHow={() => setShowHow(true)} />
+      <Header
+        roomCode={room?.code}
+        onHome={returnHome}
+        onHow={() => setShowHow(true)}
+        onLeave={room ? () => setConfirmLeave(true) : undefined}
+      />
+
+      {reconnecting && (
+        <div className="status-banner reconnecting" role="status">
+          Reconnecting… your seat and in-progress draft are still saved on this device.
+          <button onClick={() => room && void resumeRoom(room.code)}>Try now</button>
+        </div>
+      )}
+      {storageWarning && (
+        <div className="status-banner storage" role="status">
+          This browser blocked local storage. Keep this tab open; refresh recovery may be limited.
+        </div>
+      )}
 
       {error && (
         <div className="toast" role="alert">
@@ -454,6 +805,9 @@ export function GameApp() {
           onCreate={() => setView("create")}
           onJoin={() => setView("join")}
           onDemo={startPassAndPlay}
+          recentRooms={recentRooms}
+          loading={loading}
+          onResume={(code) => void resumeRoom(code)}
           onMode={(mode) => {
             setSettings((current) => withModeRecipe(current, mode));
             setView("create");
@@ -494,6 +848,11 @@ export function GameApp() {
             setCopied(true);
             window.setTimeout(() => setCopied(false), 1800);
           }}
+          onCopyResume={session.recoveryToken ? async () => {
+            await navigator.clipboard.writeText(makeResumeUrl(room.code, session.playerId, session.recoveryToken!));
+            setCopied(true);
+            window.setTimeout(() => setCopied(false), 1800);
+          } : undefined}
           onStart={startRemoteGame}
           loading={loading}
         />
@@ -510,14 +869,34 @@ export function GameApp() {
         />
       )}
 
-      {view === "gallery" && room && <Gallery room={room} onAgain={leaveRoom} />}
+      {view === "gallery" && room && session && (
+        <Gallery
+          room={room}
+          onAgain={returnHome}
+          onDelete={room.hostPlayerId === session.playerId ? deleteCurrentRoom : undefined}
+          loading={loading}
+        />
+      )}
 
       {showHow && <HowToPlay onClose={() => setShowHow(false)} />}
+      {confirmLeave && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setConfirmLeave(false)}>
+          <section className="leave-modal" role="dialog" aria-modal="true" aria-labelledby="leave-title">
+            <span className="mini-label">Leave this room?</span>
+            <h2 id="leave-title">Your seat will be released.</h2>
+            <p>Your partner can keep the room, and the host role will pass to them. Any unsent draft stays only on this device.</p>
+            <div>
+              <button className="secondary-button" onClick={() => setConfirmLeave(false)}>Stay here</button>
+              <button className="danger-button" disabled={loading} onClick={() => void leaveRoom()}>{loading ? "Leaving…" : "Leave room"}</button>
+            </div>
+          </section>
+        </div>
+      )}
     </main>
   );
 }
 
-function Header({ roomCode, onHome, onHow }: { roomCode?: string; onHome: () => void; onHow: () => void }) {
+function Header({ roomCode, onHome, onHow, onLeave }: { roomCode?: string; onHome: () => void; onHow: () => void; onLeave?: () => void }) {
   return (
     <header className="site-header">
       <button className="brand" onClick={onHome} aria-label="Ink and Echo home">
@@ -526,6 +905,7 @@ function Header({ roomCode, onHome, onHow }: { roomCode?: string; onHome: () => 
       </button>
       <div className="header-actions">
         {roomCode && roomCode !== "DEMO" && <span className="mini-room">room <strong>{roomCode}</strong></span>}
+        {onLeave && <button className="leave-button" onClick={onLeave}>Leave room</button>}
         <button className="quiet-button" onClick={onHow}>How it works</button>
       </div>
     </header>
@@ -539,6 +919,9 @@ function Landing({
   onJoin,
   onDemo,
   onMode,
+  recentRooms,
+  loading,
+  onResume,
 }: {
   playerName: string;
   setPlayerName: (value: string) => void;
@@ -546,6 +929,9 @@ function Landing({
   onJoin: () => void;
   onDemo: () => void;
   onMode: (mode: ModeId) => void;
+  recentRooms: StoredRoomSession[];
+  loading: boolean;
+  onResume: (code: string) => void;
 }) {
   return (
     <>
@@ -571,7 +957,23 @@ function Landing({
             <button className="primary-button big" onClick={onCreate}>Make a room <span>→</span></button>
             <button className="secondary-button big" onClick={onJoin}>Join a friend</button>
           </div>
-          <button className="demo-link" onClick={onDemo}><span>▶</span> Try pass & play on this device</button>
+           <button className="demo-link" onClick={onDemo}><span>▶</span> Try pass & play on this device</button>
+          {recentRooms.length > 0 && (
+            <div className="recent-rooms" aria-label="Recent rooms">
+              <span className="mini-label">Continue your duet</span>
+              {recentRooms.slice(0, 3).map((saved) => (
+                <article className="recent-room-card" key={`${saved.code}:${saved.playerId}`}>
+                  <div>
+                    <strong>{saved.code}</strong>
+                    <small>{saved.playerName ? `${saved.playerName} · ` : ""}{saved.phase === "playing" ? "game in progress" : saved.phase ?? "saved seat"}</small>
+                  </div>
+                  <div className="recent-room-actions">
+                    <button className="secondary-button" disabled={loading} onClick={() => onResume(saved.code)}>Resume</button>
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
         </div>
         <HeroChain />
       </section>
@@ -606,6 +1008,9 @@ function Landing({
           <span><b>∞</b> chances to make it weird</span>
         </div>
       </section>
+      <p className="privacy-note page-width">
+        Online prompts and drawings are stored so both players can reconnect and view the gallery. Waiting rooms expire after 24 hours, active games after 48 hours of inactivity, and finished galleries after 7 days; the host can delete sooner.
+      </p>
     </>
   );
 }
@@ -782,7 +1187,7 @@ function JoinRoom({ playerName, setPlayerName, joinCode, setJoinCode, loading, o
   );
 }
 
-function Lobby({ room, me, copied, onCopy, onStart, loading }: { room: Room; me: string; copied: boolean; onCopy: () => void; onStart: () => void; loading: boolean }) {
+function Lobby({ room, me, copied, onCopy, onCopyResume, onStart, loading }: { room: Room; me: string; copied: boolean; onCopy: () => void; onCopyResume?: () => void; onStart: () => void; loading: boolean }) {
   const amHost = room.hostPlayerId === me || room.players.find((player) => player.id === me)?.isHost;
   const ready = room.players.length === 2;
   return (
@@ -795,6 +1200,7 @@ function Lobby({ room, me, copied, onCopy, onStart, loading }: { room: Room; me:
           <div><small>Room code</small><strong>{room.code}</strong></div>
           <button onClick={onCopy}>{copied ? "Copied! ♥" : "Copy invite link"}</button>
         </div>
+        {onCopyResume && <button className="quiet-button" onClick={onCopyResume}>Copy my private recovery link</button>}
         <div className="player-seats">
           {[0, 1].map((index) => {
             const player = room.players[index];
@@ -802,7 +1208,7 @@ function Lobby({ room, me, copied, onCopy, onStart, loading }: { room: Room; me:
               <div className={player ? "seat filled" : "seat waiting"} key={index}>
                 <span>{player ? player.name.slice(0, 1).toUpperCase() : "…"}</span>
                 <div><small>{index === 0 ? "First pencil" : "Second pencil"}</small><strong>{player?.name ?? "Waiting for your person"}</strong></div>
-                {player && <i>{player.id === me ? "you" : "ready"}</i>}
+                {player && <i><span className={`presence-dot ${player.isOnline === false ? "offline" : ""}`} />{player.id === me ? "you" : player.isOnline === false ? "away" : "ready"}</i>}
               </div>
             );
           })}
@@ -832,7 +1238,7 @@ function Lobby({ room, me, copied, onCopy, onStart, loading }: { room: Room; me:
 function GameStage({ session, loading, onAction, onLocalRoom, onGallery }: {
   session: Session;
   loading: boolean;
-  onAction: (type: string, payload: Record<string, unknown>) => Promise<void>;
+  onAction: (type: string, payload: Record<string, unknown>) => Promise<boolean>;
   onLocalRoom: (room: Room) => void;
   onGallery: () => void;
 }) {
@@ -842,6 +1248,7 @@ function GameStage({ session, loading, onAction, onLocalRoom, onGallery }: {
   const currentPlayer = room.players.find((player) => player.id === active);
   const mode = modeById(room.settings.mode);
   const [timerExpired, setTimerExpired] = useState(false);
+  const [customClue, setCustomClue] = useState("");
 
   return (
     <section className="game-page page-width">
@@ -852,6 +1259,7 @@ function GameStage({ session, loading, onAction, onLocalRoom, onGallery }: {
           key={`${room.turnIndex}-${active}-${room.currentTurn?.kind}-${room.currentTurn?.deadlineAt ?? "relaxed"}`}
           seconds={room.settings.timerSeconds}
           deadlineAt={room.currentTurn?.deadlineAt}
+          serverNow={room.serverNow}
           onExpire={() => {
             if (isMyTurn) setTimerExpired(true);
           }}
@@ -864,8 +1272,26 @@ function GameStage({ session, loading, onAction, onLocalRoom, onGallery }: {
           <div className="thinking-doodle" aria-hidden="true"><i /><i /><i /></div>
           <span className="mini-label">Pencil is across the table</span>
           <h1>{currentPlayer?.name ?? "Your partner"} is making a choice.</h1>
-          <p>No peeking. This is a good moment to predict how wonderfully wrong the next thing will be.</p>
-          <div className="waiting-note"><span className="pulse-dot" /> Their turn is live</div>
+          <p>{currentPlayer?.isOnline === false ? "They seem to be away, but their seat is reserved and the game will wait for the next server-timed beat." : "No peeking. This is a good moment to predict how wonderfully wrong the next thing will be."}</p>
+          {room.currentTurn?.canAddClue && (
+            <div className="clue-composer">
+              <label>
+                <span>Send a vague clue</span>
+                <input
+                  value={customClue}
+                  maxLength={80}
+                  placeholder="Think: tiny, nocturnal, dramatic…"
+                  onChange={(event) => setCustomClue(event.target.value)}
+                />
+              </label>
+              <button
+                className="secondary-button"
+                disabled={!customClue.trim() || loading}
+                onClick={() => void onAction("add_clue", { text: customClue.trim() }).then((sent) => sent && setCustomClue(""))}
+              >Send clue</button>
+            </div>
+          )}
+          <div className="waiting-note"><span className={`presence-dot ${currentPlayer?.isOnline === false ? "offline" : ""}`} /> {currentPlayer?.isOnline === false ? "Partner is reconnecting" : "Their turn is live"}</div>
         </div>
       )}
     </section>
@@ -884,14 +1310,16 @@ function RoundProgress({ current, total }: { current: number; total: number }) {
   );
 }
 
-function Timer({ seconds, deadlineAt, onExpire }: { seconds: number; deadlineAt?: number; onExpire?: () => void }) {
+function Timer({ seconds, deadlineAt, serverNow, onExpire }: { seconds: number; deadlineAt?: number; serverNow?: number; onExpire?: () => void }) {
   const [left, setLeft] = useState(seconds);
   const leftRef = useRef(seconds);
   const firedRef = useRef(false);
+  const clockOffsetRef = useRef(0);
   useEffect(() => {
+    clockOffsetRef.current = serverNow ? serverNow - Date.now() : 0;
     const update = () => {
       const next = deadlineAt
-        ? Math.max(0, Math.ceil((deadlineAt - Date.now()) / 1000))
+        ? Math.max(0, Math.ceil((deadlineAt - (Date.now() + clockOffsetRef.current)) / 1000))
         : Math.max(0, leftRef.current - 1);
       leftRef.current = next;
       setLeft(next);
@@ -908,7 +1336,7 @@ function Timer({ seconds, deadlineAt, onExpire }: { seconds: number; deadlineAt?
       window.clearTimeout(initialSync);
       window.clearInterval(timer);
     };
-  }, [deadlineAt, onExpire]);
+  }, [deadlineAt, onExpire, serverNow]);
   const minutes = Math.floor(left / 60);
   const remaining = String(left % 60).padStart(2, "0");
   return <div className={`turn-timer ${left <= 10 ? "urgent" : ""}`}><small>Gentle panic</small><strong>{minutes}:{remaining}</strong></div>;
@@ -919,7 +1347,7 @@ function TurnWorkspace({ room, playerId, loading, timerExpired, onAction, onLoca
   playerId: string;
   loading: boolean;
   timerExpired: boolean;
-  onAction: (type: string, payload: Record<string, unknown>) => Promise<void>;
+  onAction: (type: string, payload: Record<string, unknown>) => Promise<boolean>;
   onLocalRoom: (room: Room) => void;
   onGallery: () => void;
 }) {
@@ -930,6 +1358,16 @@ function TurnWorkspace({ room, playerId, loading, timerExpired, onAction, onLoca
   const canvasRef = useRef<DrawingCanvasHandle>(null);
   const latestDrawingRef = useRef("");
   const autoSubmittedRef = useRef(false);
+  const draftSaveTimerRef = useRef<number | undefined>(undefined);
+  const [draftReady, setDraftReady] = useState(false);
+  const [draftNote, setDraftNote] = useState("");
+  const isDrawing = ["draw", "memory", "remix", "blind-draw"].includes(turn.kind);
+  const draftKey = turnDraftKey(room.code, playerId, roomTurnSignature(room));
+  const clockOffsetRef = useRef(0);
+
+  useEffect(() => {
+    clockOffsetRef.current = room.serverNow ? room.serverNow - Date.now() : 0;
+  }, [room.serverNow]);
 
   useEffect(() => {
     const shouldPreview = turn.kind === "memory" && Boolean(turn.previousImage);
@@ -937,7 +1375,7 @@ function TurnWorkspace({ room, playerId, loading, timerExpired, onAction, onLoca
     const update = () => {
       setMemorySeconds((seconds) => {
         const next = turn.revealUntil
-          ? Math.max(0, Math.ceil((turn.revealUntil - Date.now()) / 1000))
+          ? Math.max(0, Math.ceil((turn.revealUntil - (Date.now() + clockOffsetRef.current)) / 1000))
           : Math.max(0, seconds - 1);
         if (next <= 0) {
           setMemoryVisible(false);
@@ -954,7 +1392,68 @@ function TurnWorkspace({ room, playerId, loading, timerExpired, onAction, onLoca
     };
   }, [room.turnIndex, turn.kind, turn.previousImage, turn.revealUntil]);
 
-  function advanceDemo(entry: GalleryEntry) {
+  useEffect(() => {
+    let cancelled = false;
+    const restore = async () => {
+      const saved = await readTurnDraft(draftKey);
+      if (cancelled) return;
+      if (saved?.text && !isDrawing) setText(saved.text);
+      if (saved?.imageData && isDrawing && !memoryVisible && canvasRef.current) {
+        try {
+          const parsed = JSON.parse(saved.imageData) as unknown;
+          await canvasRef.current.loadDraft(parsed as Parameters<DrawingCanvasHandle["loadDraft"]>[0]);
+          if (!cancelled) setDraftNote("Recovered your in-progress sketch.");
+        } catch {
+          try {
+            await canvasRef.current.loadDataUrl(saved.imageData);
+            if (!cancelled) setDraftNote("Recovered your in-progress sketch.");
+          } catch {
+            if (!cancelled) setDraftNote("This old sketch draft could not be restored safely.");
+          }
+        }
+      } else if (saved?.text && !cancelled) {
+        setDraftNote("Recovered your in-progress words.");
+      }
+      if (!cancelled) setDraftReady(true);
+    };
+    void restore();
+    return () => {
+      cancelled = true;
+    };
+  }, [draftKey, isDrawing, memoryVisible]);
+
+  useEffect(() => {
+    if (!draftReady || isDrawing) return;
+    const timer = window.setTimeout(() => {
+      void saveTurnDraft({ key: draftKey, text, updatedAt: Date.now() });
+    }, 350);
+    return () => window.clearTimeout(timer);
+  }, [draftKey, draftReady, isDrawing, text]);
+
+  useEffect(() => () => window.clearTimeout(draftSaveTimerRef.current), []);
+
+  const saveDrawingDraftSoon = useCallback(() => {
+    if (!draftReady) return;
+    window.clearTimeout(draftSaveTimerRef.current);
+    draftSaveTimerRef.current = window.setTimeout(() => {
+      void (async () => {
+        try {
+          const saved = await canvasRef.current?.saveDraft();
+          if (!saved) return;
+          const ok = await saveTurnDraft({
+            key: draftKey,
+            imageData: JSON.stringify(saved),
+            updatedAt: Date.now(),
+          });
+          if (!ok) setDraftNote("This browser could not save the draft locally.");
+        } catch {
+          setDraftNote("This browser could not save the latest sketch locally.");
+        }
+      })();
+    }, 450);
+  }, [draftKey, draftReady]);
+
+  const advanceDemo = useCallback((entry: GalleryEntry) => {
     const gallery = [...(room.gallery ?? []), entry];
     const nextIndex = (room.turnIndex ?? 0) + 1;
     if (nextIndex >= room.settings.rounds) {
@@ -963,8 +1462,28 @@ function TurnWorkspace({ room, playerId, loading, timerExpired, onAction, onLoca
       return;
     }
     const nextPlayerId = room.activePlayerId === "demo-a" ? "demo-b" : "demo-a";
-    const last = gallery[gallery.length - 1];
-    const kind: CurrentTurn["kind"] = nextIndex % 2 === 1 ? "draw" : "guess";
+    const lastDrawing = [...gallery].reverse().find((item) => item.imageData);
+    const lastText = [...gallery].reverse().find((item) => item.text);
+    const mode = room.settings.mode;
+    let kind: CurrentTurn["kind"] = nextIndex % 2 === 1 ? "draw" : "guess";
+    if (mode === "memory-drift") kind = nextIndex === 1 ? "draw" : "memory";
+    if (mode === "blind-prompt") kind = nextIndex % 2 === 1 ? "blind-draw" : "prompt";
+    if (mode === "remix-mode") kind = nextIndex === 1 ? "draw" : "remix";
+    if (mode === "story-canvas") kind = nextIndex % 2 === 1 ? "draw" : "caption";
+    const rule = kind === "remix" ? DEMO_REMIX_RULES[(nextIndex - 2) % DEMO_REMIX_RULES.length] : undefined;
+    const instruction = kind === "draw"
+      ? mode === "story-canvas" ? "Draw the next panel from the last caption." : "Draw only what the last words suggest."
+      : kind === "guess"
+        ? "Name the mysterious thing you see."
+        : kind === "memory"
+          ? "Look closely, then recreate this drawing from memory."
+          : kind === "blind-draw"
+            ? "Draw from the clue without seeing the full prompt."
+            : kind === "remix"
+              ? "Keep the old idea and obey the new remix rule."
+              : kind === "caption"
+                ? "Caption this as the next beat of your tiny story."
+                : "Plant the next strange little idea.";
     onLocalRoom({
       ...room,
       version: room.version + 1,
@@ -975,25 +1494,43 @@ function TurnWorkspace({ room, playerId, loading, timerExpired, onAction, onLoca
         kind,
         round: nextIndex + 1,
         playerId: nextPlayerId,
-        previousText: last.text,
-        previousImage: last.imageData,
-        prompt: kind === "draw" ? last.text : undefined,
-        instruction: kind === "draw" ? "Draw only what the last words suggest." : "Name the mysterious thing you see.",
+        previousText: kind === "blind-draw" ? undefined : lastText?.text,
+        previousImage: lastDrawing?.imageData,
+        prompt: kind === "draw" ? lastText?.text : kind === "prompt" && room.settings.randomPrompts ? DEMO_PROMPTS[nextIndex % DEMO_PROMPTS.length] : undefined,
+        clue: kind === "blind-draw" ? "It has a very recognizable silhouette." : undefined,
+        rule,
+        instruction,
       },
     });
-  }
+  }, [onGallery, onLocalRoom, room]);
 
   async function submitText() {
     if (!text.trim()) return;
     if (room.code === "DEMO") {
       advanceDemo({ round: turn.round, kind: turn.kind, playerId, playerName: room.players.find((p) => p.id === room.activePlayerId)?.name, text: text.trim() });
+      await deleteTurnDraft(draftKey);
     } else {
-      await onAction("submit_text", { text: text.trim(), kind: turn.kind });
+      const sent = await onAction("submit_text", { text: text.trim(), kind: turn.kind });
+      if (sent) await deleteTurnDraft(draftKey);
     }
   }
 
   async function submitDrawing() {
-    const imageData = canvasRef.current?.exportDataUrl() || latestDrawingRef.current;
+    setDraftNote("Preparing a lightweight copy…");
+    const exported = await canvasRef.current?.exportCompressed({
+      type: "image/webp",
+      quality: 0.86,
+      minQuality: 0.5,
+      // Base64 adds roughly one third; this stays below the server's 1.5M-character data-URL cap.
+      maxBytes: 1_100_000,
+      maxDimension: 1080,
+      allowResize: true,
+    });
+    if (exported && !exported.withinLimit) {
+      setDraftNote("This drawing is still too large to send. Try clearing a photo-like background or simplifying the canvas.");
+      return;
+    }
+    const imageData = exported?.dataUrl || latestDrawingRef.current;
     if (!imageData) return;
     if (room.code === "DEMO") {
       advanceDemo({
@@ -1004,37 +1541,47 @@ function TurnWorkspace({ room, playerId, loading, timerExpired, onAction, onLoca
         imageData,
         rule: turn.rule,
       });
+      await deleteTurnDraft(draftKey);
     } else {
-      await onAction("submit_drawing", { imageData, kind: turn.kind, rule: turn.rule });
+      const sent = await onAction("submit_drawing", { imageData, kind: turn.kind, rule: turn.rule });
+      if (sent) await deleteTurnDraft(draftKey);
     }
   }
 
-  const isDrawing = ["draw", "memory", "remix", "blind-draw"].includes(turn.kind);
   useEffect(() => {
     if (
       !timerExpired ||
-      room.settings.mode !== "speed-chaos" ||
-      room.code === "DEMO" ||
       autoSubmittedRef.current
     ) {
       return;
     }
     autoSubmittedRef.current = true;
     const autoSubmit = window.setTimeout(() => {
-      if (isDrawing) {
-        const imageData = canvasRef.current?.exportDataUrl() || latestDrawingRef.current;
-        if (imageData) {
-          void onAction("submit_drawing", { imageData, kind: turn.kind, rule: turn.rule });
+      if (room.code === "DEMO") {
+        if (room.settings.mode !== "speed-chaos") return;
+        if (isDrawing) {
+          advanceDemo({
+            round: turn.round,
+            kind: turn.kind,
+            playerId,
+            playerName: room.players.find((player) => player.id === room.activePlayerId)?.name,
+            imageData: latestDrawingRef.current || DEMO_EMPTY_DRAWING,
+          });
+        } else {
+          advanceDemo({
+            round: turn.round,
+            kind: turn.kind,
+            playerId,
+            playerName: room.players.find((player) => player.id === room.activePlayerId)?.name,
+            text: text.trim() || "A very fast mystery!",
+          });
         }
-      } else {
-        void onAction("submit_text", {
-          text: text.trim() || "A very fast mystery!",
-          kind: turn.kind,
-        });
+        return;
       }
+      void onAction("expire_turn", {});
     }, 0);
     return () => window.clearTimeout(autoSubmit);
-  }, [isDrawing, onAction, room.code, room.settings.mode, text, timerExpired, turn.kind, turn.rule]);
+  }, [advanceDemo, isDrawing, onAction, playerId, room.activePlayerId, room.code, room.players, room.settings.mode, text, timerExpired, turn.kind, turn.round]);
 
   if (isDrawing) {
     if (memoryVisible && turn.previousImage) {
@@ -1067,6 +1614,7 @@ function TurnWorkspace({ room, playerId, loading, timerExpired, onAction, onLoca
           initialBackgroundColor="#fffdf8"
           onChange={(dataUrl) => {
             latestDrawingRef.current = dataUrl;
+            saveDrawingDraftSoon();
           }}
           disabled={loading}
           downloadFileName={`ink-and-echo-round-${turn.round}.png`}
@@ -1074,8 +1622,21 @@ function TurnWorkspace({ room, playerId, loading, timerExpired, onAction, onLoca
         />
         <div className="drawing-submit-row">
           <span><kbd>P</kbd> pen · <kbd>E</kbd> erase · <kbd>⌘Z</kbd> undo · touch friendly</span>
+          {draftNote && <small className="draft-note" role="status">{draftNote}</small>}
           {turn.kind === "blind-draw" && (
-            <button className="secondary-button" disabled={loading} onClick={() => onAction("add_clue", {})}>One more clue</button>
+            <button className="secondary-button" disabled={loading} onClick={() => {
+              if (room.code === "DEMO") {
+                onLocalRoom({
+                  ...room,
+                  version: room.version + 1,
+                  currentTurn: turn.clue?.includes("silhouette")
+                    ? { ...turn, clue: "Its mood is more dramatic than practical." }
+                    : { ...turn, clue: "One small detail is doing most of the storytelling." },
+                });
+                return;
+              }
+              void onAction("add_clue", {});
+            }}>One more clue</button>
           )}
           <button className="primary-button" onClick={submitDrawing} disabled={loading}>{loading ? "Passing the sketch…" : "Send this masterpiece →"}</button>
         </div>
@@ -1095,7 +1656,7 @@ function TurnWorkspace({ room, playerId, loading, timerExpired, onAction, onLoca
         <small>{text.length}/180</small>
       </label>
       <div className="workspace-actions">
-        <span>There are no wrong answers. Only future callbacks.</span>
+        <span>{draftNote || "There are no wrong answers. Only future callbacks."}</span>
         <button className="primary-button" onClick={submitText} disabled={!text.trim() || loading}>{loading ? "Passing it over…" : "Lock it in →"}</button>
       </div>
     </div>
@@ -1113,7 +1674,7 @@ function TurnBrief({ turn }: { turn: CurrentTurn }) {
   );
 }
 
-function Gallery({ room, onAgain }: { room: Room; onAgain: () => void }) {
+function Gallery({ room, onAgain, onDelete, loading }: { room: Room; onAgain: () => void; onDelete?: () => Promise<void>; loading: boolean }) {
   const entries = room.gallery ?? [];
   const mode = modeById(room.settings.mode);
   function downloadEntry(entry: GalleryEntry, index: number) {
@@ -1150,7 +1711,13 @@ function Gallery({ room, onAgain }: { room: Room; onAgain: () => void }) {
         ))}
         {!entries.length && <div className="empty-gallery">No turns yet — your first inside joke is still warming up.</div>}
       </div>
-      <div className="gallery-footer"><span>Thanks for making something strange together. ♥</span><button className="primary-button big" onClick={onAgain}>Make another chain →</button></div>
+      <div className="gallery-footer">
+        <span>Thanks for making something strange together. ♥</span>
+        <div>
+          {onDelete && <button className="danger-button" disabled={loading} onClick={() => window.confirm("Permanently delete this room and its gallery?") && void onDelete()}>{loading ? "Deleting…" : "Delete room"}</button>}
+          <button className="primary-button big" onClick={onAgain}>Back home →</button>
+        </div>
+      </div>
     </section>
   );
 }

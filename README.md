@@ -13,6 +13,8 @@ It takes inspiration from drawing telephone games without copying their structur
 - Beginner-friendly Canvas 2D desk with freehand, eraser, size/color controls, undo/redo, clear confirmation, background, shapes, text, touch input, and image export.
 - Clear turn brief, timer, progress journey, and partner waiting state.
 - Versioned room persistence through Cloudflare D1 and low-cost polling.
+- Recoverable browser sessions, recent-room shortcuts, safe leave/host transfer, and local turn drafts.
+- Server-owned turn deadlines, presence status, request limits, and automatic room expiry.
 - End gallery with per-image download, print styling, and JSON story export.
 - Deterministic TypeScript game content: prompt cards, progressive clue ladders, remix rules, memory twists, story beats, and optional two-person Duo Beats.
 
@@ -145,26 +147,52 @@ Important exports include:
 
 The server must still own the actual turn and send the redacted projection. A shared deterministic seed prevents accidental rule drift; it is not permission to send a secret prompt to the drawer.
 
-## State and realtime design
+## Rooms, sessions, and recovery
 
-Rooms move through `waiting → playing → finished/gallery`. D1 stores:
+Rooms move through `waiting → playing → finished/gallery`. D1 stores one versioned room snapshot, exactly two possible player seats, and an immutable chain of prompts, drawings, guesses, and captions. Blind Prompt targets and mode-disallowed history stay redacted until the gallery.
 
-- one room snapshot with normalized settings, current turn, phase, and a monotonic version;
-- at most two players, enforced by unique room/seat constraints;
-- immutable chain entries with their ordinal, author, kind, text/image payload, metadata, and room version.
+### Browser session model
 
-Clients poll the room endpoint about every 900 ms with `sinceVersion`. An unchanged room returns no new payload. Mutations send `expectedVersion`; the server authenticates the player's room token, verifies that it is their turn and the artifact kind matches, and advances only if the version still matches. A stale submission receives a conflict and refreshes.
+- The active player token lives in `sessionStorage`, so it is available across refreshes in the current browser session but is not a long-lived local credential.
+- A separate recovery token lives in `localStorage`. If the active token is missing or invalid, the recovery endpoint verifies its server-side hash and issues a fresh active token.
+- The landing page lists up to three recent rooms saved on this device. **Resume** first tries the active session, then recovery, without asking the player to take a new seat.
+- A normal invite is `?room=CODE` and is safe to send to the other player. **Copy my private recovery link** adds the player id and recovery token after `#resume=`. URL fragments are not sent in HTTP requests, and the app removes the fragment after recovery succeeds. Each recovery rotates that secret, so an already-used private link cannot take the seat again. Treat a fresh private link like a password.
+- If browser storage is blocked, the game still works while the tab remains open, but refresh and recent-room recovery may be limited. The UI warns the player when this happens.
 
-The room API is intentionally four surfaces:
+Only token hashes are stored on the server. A room code finds a room; it does not authorize a player action.
 
-- `POST /api/rooms` — create and claim seat 0;
-- `POST /api/rooms/:code/join` — atomically claim seat 1;
-- `GET /api/rooms/:code` — fetch the viewer-specific state or report unchanged;
-- `POST /api/rooms/:code/actions` — start, submit text/drawing, or reveal a clue.
+### Local draft recovery
 
-Blind Prompt targets and mode-disallowed history are redacted until the gallery. Room codes locate a room but are not credentials; random player tokens authorize actions and only their hashes are persisted.
+Text and drawing drafts are keyed to the room, player, and exact turn. Text is saved after a short pause; drawings save a compressed ink layer plus the paper color. IndexedDB is preferred, with `localStorage` as a fallback.
 
-The browser keeps only the current room code, player id, and one-time token in device-local storage so a refresh can resume the same seat. It never stores the gallery or drawings there, and **Leave room** clears the saved credential.
+On refresh or reconnect, the matching draft is restored automatically. A draft is deleted only after the server confirms the submission, so an uncertain network response does not erase work. Drafts remain on that browser and are never uploaded until **Lock it in** or **Send this masterpiece** is used.
+
+### Realtime, deadlines, and presence
+
+Clients poll by room version about every 900 ms, pause while hidden, wake immediately when the tab returns, and back off to at most 10 seconds after network failures. Same-browser tabs notify each other after a change, while a short local action lease and server-side version check prevent duplicate submissions.
+
+Every timed turn includes `deadlineAt` and `serverNow`. The browser corrects for clock difference, but the server is authoritative: it advances expired turns during reads or actions, accepts only a small 1.5-second transport grace, and rejects late content. Presence is based on authenticated activity/heartbeats; a player is shown as away after about 45 seconds without one.
+
+### Leaving and deleting
+
+**Leave room** asks for confirmation and clears this device's active and recovery credentials only after the server accepts the leave. If the host leaves while the partner remains, host ownership transfers automatically. Leaving during an active game ends the current chain safely so the remaining player can keep the completed history. Leaving as the only player closes the room immediately and schedules its retained tombstone for cleanup, which keeps repeated leave requests safe.
+
+The current host can permanently delete a finished room and gallery. This is separate from merely returning to the home screen.
+
+### Limits and room lifetime
+
+The API returns `429` with a retry time instead of accepting bursts indefinitely:
+
+| Request | Limit |
+| --- | --- |
+| Create / recover | 10 per 10 minutes |
+| Join | 30 per 10 minutes |
+| Poll / action | 180 / 60 per minute |
+| Heartbeat | 12 per minute |
+| Leave | 10 per minute |
+| Delete | 5 per 10 minutes |
+
+Activity extends a room's lifetime. Waiting rooms expire after 24 hours, games in progress after 48 hours, and finished galleries after 7 days. Expired rooms and their players/entries are deleted automatically; hosts may delete sooner.
 
 The full model, endpoint payloads, concurrency rules, and storage schema are in [Architecture](docs/architecture.md).
 
@@ -172,7 +200,11 @@ The full model, endpoint payloads, concurrency rules, and storage schema are in 
 
 The selected canvas preset determines a stable backing resolution; CSS only changes how large it appears. Pointer positions are transformed into backing coordinates, so drawings remain sharp and correctly aligned on phones and tablets.
 
-The drawing layer stays transparent above a separately tracked paper color. Freehand lines use coalesced pointer samples and quadratic midpoint smoothing; shape tools preview by restoring a temporary `ImageData` snapshot until pointer-up. After each committed change, undo/redo keeps a capped PNG snapshot plus the paper color, and export composites both layers into PNG/WebP. This bitmap-history approach is simple and dependable for the short canvases in a two-person session; an operation log is a future optimization for very long drawings.
+The drawing layer stays transparent above a separately tracked paper color. Freehand lines use coalesced pointer samples and quadratic midpoint smoothing; shape tools preview by restoring a temporary `ImageData` snapshot until pointer-up. Undo/redo keeps compressed WebP `Blob` snapshots within a 12 MB mobile or 24 MB desktop budget, and export composites the ink with its paper color. This bounded bitmap history stays dependable without retaining dozens of full PNG strings.
+
+Before an online submission, the canvas prefers WebP (falling back to JPEG), lowers quality if needed, and progressively resizes to at most 1080 px so the transport stays lightweight. The server accepts only PNG, JPEG, or WebP data URLs, caps the encoded payload at 1.5 million characters, verifies the decoded format signature, and rejects unsafe dimensions or pixel counts.
+
+The **Open** tool validates local images before decoding them: PNG/JPEG/WebP only, at most 8 MB, no side longer than 8192 px, and no more than 24 million pixels. Imported files remain local unless the resulting canvas is submitted.
 
 Recommended shortcuts:
 
@@ -188,15 +220,19 @@ Recommended shortcuts:
 
 On touch screens, the drawable surface alone disables browser gestures while drawing; toolbar controls remain normal scrolling targets and are at least 44 CSS pixels.
 
-## Deployment from GitHub
+## Local → GitHub → Sites workflow
 
-### Option A: OpenAI Sites (least configuration for this repository)
+The recommended path for this repository is:
 
-The repository already includes `.openai/hosting.json` with a D1 binding named `DB`. Push the project to GitHub, import that repository into Sites, and publish it. The platform builds the Vite/vinext application and provisions the declared binding. Use this path when the game is being developed in Codex and you want the shortest route from a GitHub repo to a shareable URL.
+1. Develop locally with `npm run dev`. The Cloudflare/Vite plugin supplies a project-local D1 database; no cloud account or `.env` file is required.
+2. Before pushing, run `npm test` and verify create/join/resume in two browser sessions.
+3. Push the source to GitHub. Do not commit `.env.local`, Cloudflare tokens, or database ids.
+4. Import the GitHub repository into OpenAI Sites and publish it. `.openai/hosting.json` declares the D1 binding as `DB`, so Sites can provision and attach it during deployment. Room tables initialize on first use.
+5. On the published URL, smoke-test an invite in a private window, refresh both seats, submit one drawing, leave, and resume from the recent-room card.
 
-Before publishing, run `npm run build` locally and verify a two-window room.
+This is the shortest path to a shareable online game with realtime rooms. Later GitHub pushes can be rebuilt and republished through the same Sites project.
 
-### Option B: Cloudflare Workers from GitHub
+### Direct Cloudflare Workers deployment
 
 vinext has native Cloudflare Workers deployment support.
 
@@ -208,33 +244,7 @@ One-time setup:
 4. Authenticate locally with `npx wrangler login`, or add `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, and `CLOUDFLARE_D1_DATABASE_ID` as GitHub Actions secrets.
 5. Deploy with `npx vinext deploy`. The build reads the D1 id from the environment and binds it as `DB`; it never relies on the local placeholder id in production.
 
-A minimal GitHub Actions job can run on pushes to `main`:
-
-```yaml
-name: deploy
-on:
-  push:
-    branches: [main]
-jobs:
-  cloudflare:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm test
-      - run: npx vinext deploy
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
-          CLOUDFLARE_D1_DATABASE_NAME: ink-and-echo
-```
-
-Use Cloudflare's Git integration instead if preferred; keep the same Node version, build command, worker entry, and `DB` binding, and add `CLOUDFLARE_D1_DATABASE_ID` to the build environment.
+For continuous deployment, run `npm ci`, `npm test`, and `npx vinext deploy` in GitHub Actions with `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, and `CLOUDFLARE_D1_DATABASE_ID` stored as repository secrets. Cloudflare's Git integration is also suitable when configured with Node 22, the same environment values, and the `DB` binding.
 
 ### About GitHub Pages
 
@@ -250,9 +260,10 @@ The project is divided so each layer can be verified independently:
 4. **Room authority** — D1 tables, token authentication, two-seat enforcement, mode transitions, optimistic concurrency, and viewer projections.
 5. **Gallery and exports** — complete ordered chain, blind-target reveal, individual downloads, print view, and portable JSON.
 6. **Verification** — build/lint, seeded engine tests, room concurrency tests, two-browser smoke test, touch/keyboard pass, and responsive visual QA.
-7. **Production hardening** — room expiration, image byte limits, object storage, reconnect backoff, rate limits, and end-to-end browser tests.
+7. **Session hardening** — split active/recovery credentials, recent-room resume, private recovery links, local drafts, server deadlines, presence, safe leave/delete, rate limits, and expiry.
+8. **Scale follow-up** — object storage, scheduled cleanup telemetry, abuse controls, and end-to-end browser coverage for recovery and lifecycle edges.
 
-The first five layers form the deployable MVP. The hardening layer should be completed before opening anonymous rooms to a large public audience.
+The first seven layers form the current deployable MVP. Complete the scale follow-up before opening anonymous rooms to a large public audience.
 
 ## Future realtime upgrade
 
@@ -266,7 +277,7 @@ Polling is isolated behind a small room transport and can be replaced without ch
 
 - Add a single-sheet PNG/PDF comic export.
 - Store full drawings in R2 and small thumbnails in room responses.
-- Add reconnectable player sessions and room expiration.
+- Add operational visibility for expiry cleanup, rate-limit pressure, and recovery failures.
 - Add opt-in custom prompt packs and cozy/absurd/spooky-light filters.
 - Add private gallery reactions such as “perfectly wrong” and “I love this bit.”
 - Add a rematch that swaps the starting seat and avoids the previous prompt order.

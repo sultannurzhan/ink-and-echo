@@ -8,6 +8,20 @@
       "when": 1783887290508,
       "tag": "0000_burly_wildside",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1783891359331,
+      "tag": "0001_flaky_iron_man",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1783891876652,
+      "tag": "0002_absent_robbie_robertson",
+      "breakpoints": true
     }
   ]
 }
