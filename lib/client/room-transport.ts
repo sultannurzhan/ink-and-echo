@@ -1,7 +1,14 @@
+import type { Room } from "./game-types.ts";
+
 export type RoomCredentials = {
   playerId: string;
   playerToken: string;
 };
+
+export async function roomFetch(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = 15_000) {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  return fetch(input, { ...init, signal: init.signal ? AbortSignal.any([init.signal, timeout]) : timeout });
+}
 
 export class RoomApiError extends Error {
   status: number;
@@ -13,6 +20,23 @@ export class RoomApiError extends Error {
     this.status = status;
     this.code = code;
   }
+}
+
+export function readRoomSnapshot(value: unknown): Room {
+  const body = value as { room?: unknown } | null;
+  const candidate = body?.room ?? value;
+  const room = candidate as Room | null;
+  if (!room || !/^[A-Z0-9]{6}$/.test(room.code) || !Number.isInteger(room.version) || room.version < 1 ||
+      !["lobby", "playing", "gallery", "finished"].includes(room.phase) ||
+      !Array.isArray(room.players) || room.players.length > 2 ||
+      room.players.some((player) => !player || typeof player.id !== "string" || typeof player.name !== "string") ||
+      !room.settings || typeof room.settings.mode !== "string" ||
+      !Number.isFinite(room.settings.rounds) || !Number.isFinite(room.settings.timerSeconds) ||
+      (room.phase === "playing" && (!room.currentTurn || typeof room.currentTurn.kind !== "string")) ||
+      (room.gallery !== undefined && !Array.isArray(room.gallery))) {
+    throw new RoomApiError(502, "invalid_room_response", "The room server returned an incomplete room. Your saved seat is safe; please try again.");
+  }
+  return room;
 }
 
 export function roomAuthHeaders(

@@ -31,9 +31,15 @@ async function withStore<T>(
   return new Promise<T>((resolve, reject) => {
     const transaction = database.transaction(STORE_NAME, mode);
     const request = operation(transaction.objectStore(STORE_NAME));
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
-    transaction.oncomplete = () => database.close();
+    // Request success is provisional: quota/commit failures can still abort it.
+    transaction.oncomplete = () => {
+      database.close();
+      resolve(request.result);
+    };
+    transaction.onabort = () => {
+      database.close();
+      reject(transaction.error ?? new Error("Draft transaction aborted."));
+    };
     transaction.onerror = () => reject(transaction.error);
   });
 }
@@ -53,16 +59,22 @@ export async function saveTurnDraft(draft: TurnDraft) {
 }
 
 export async function readTurnDraft(key: string): Promise<TurnDraft | null> {
+  let primary: TurnDraft | null = null;
+  let fallback: TurnDraft | null = null;
   try {
-    return (await withStore("readonly", (store) => store.get(key))) ?? null;
+    primary = (await withStore("readonly", (store) => store.get(key))) ?? null;
   } catch {
-    try {
-      const value = localStorage.getItem(`${FALLBACK_PREFIX}${key}`);
-      return value ? (JSON.parse(value) as TurnDraft) : null;
-    } catch {
-      return null;
-    }
+    // Read the fallback even after a successful IndexedDB miss.
   }
+  try {
+    const value = localStorage.getItem(`${FALLBACK_PREFIX}${key}`);
+    fallback = value ? JSON.parse(value) as TurnDraft : null;
+  } catch { /* One unavailable tier must not hide the other. */ }
+  const valid = (value: TurnDraft | null): value is TurnDraft => Boolean(
+    value && value.key === key && Number.isFinite(value.updatedAt) &&
+    (typeof value.text === "string" || typeof value.imageData === "string"),
+  );
+  return [primary, fallback].filter(valid).sort((a, b) => b.updatedAt - a.updatedAt)[0] ?? null;
 }
 
 export async function deleteTurnDraft(key: string) {

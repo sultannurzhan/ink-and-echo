@@ -11,6 +11,17 @@ export type StoredRoomSession = {
 
 type StorageLike = Pick<Storage, "getItem" | "setItem" | "removeItem" | "key" | "length">;
 
+// Accessing the storage property itself can throw (privacy mode / sandbox).
+export function browserStorage(kind: "local" | "session"): StorageLike {
+  try { return kind === "local" ? window.localStorage : window.sessionStorage; }
+  catch {
+    return {
+      length: 0, key: () => null, getItem: () => null, removeItem: () => undefined,
+      setItem: () => { throw new Error("Browser storage is unavailable."); },
+    };
+  }
+}
+
 const RECOVERY_PREFIX = "ink-and-echo:recovery:";
 const ACTIVE_PREFIX = "ink-and-echo:active:";
 const LEGACY_PREFIX = "ink-and-echo:room:";

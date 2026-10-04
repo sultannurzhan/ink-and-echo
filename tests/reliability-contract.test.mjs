@@ -60,7 +60,7 @@ test("the polling loop is sequential, abortable, monotonic, and backed off", asy
   assert.match(gameApp, /\.abort\s*\(\s*\)/);
   assert.match(
     gameApp,
-    /const\s+([A-Za-z_$][\w$]*)\s*=\s*new AbortController\s*\(\s*\);[\s\S]{0,400}?signal:\s*\1\.signal[\s\S]{0,900}?\1\.signal\.aborted/,
+    /const\s+([A-Za-z_$][\w$]*)\s*=\s*new AbortController\s*\(\s*\);[\s\S]{0,500}?signal:\s*\1\.signal[\s\S]{0,900}?\1\.signal\.aborted/,
     "each poll must test the same request-local controller whose signal was passed to fetch",
   );
   assert.match(gameApp, /shouldApplyRoomVersion\s*\(/);

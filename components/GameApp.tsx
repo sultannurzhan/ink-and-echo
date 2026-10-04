@@ -2,16 +2,22 @@
 /* eslint-disable @next/next/no-img-element -- Player-created data URLs cannot use Next image optimization. */
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { apiUrl } from "@/lib/client/api-url";
+import { downloadJson, parseStoryArchive, storyArchive, MAX_STORY_BYTES } from "@/lib/client/story-archive";
+import { useDialogFocus } from "./useDialogFocus";
 import { DrawingCanvas, type DrawingCanvasHandle } from "@/components/DrawingCanvas";
 import {
   isConfirmedInvalidAuth,
   pollingDelay,
   readRoomJson,
+  readRoomSnapshot,
+  roomFetch,
   roomAuthHeaders,
   RoomApiError,
   shouldApplyRoomVersion,
 } from "@/lib/client/room-transport";
 import {
+  browserStorage,
   listRecoverySessions,
   makeResumeUrl,
   pruneRecoverySessions,
@@ -32,86 +38,8 @@ import {
   turnDraftKey,
 } from "@/lib/client/draft-store";
 
-type View = "landing" | "create" | "join" | "lobby" | "game" | "gallery";
-type ModeId =
-  | "classic-chain"
-  | "memory-drift"
-  | "blind-prompt"
-  | "remix-mode"
-  | "speed-chaos"
-  | "story-canvas"
-  | "guess-evolution";
-
-type Settings = {
-  mode: ModeId;
-  rounds: number;
-  timerSeconds: number;
-  randomPrompts: boolean;
-  canvasSize: "square" | "classic" | "wide";
-};
-
-type Player = {
-  id: string;
-  name: string;
-  isHost?: boolean;
-  isOnline?: boolean;
-  lastSeenAt?: number;
-};
-type GalleryEntry = {
-  id?: string;
-  round: number;
-  kind: string;
-  playerId?: string;
-  playerName?: string;
-  text?: string;
-  imageData?: string;
-  rule?: string;
-  metadata?: {
-    expired?: boolean;
-    [key: string]: unknown;
-  };
-};
-type CurrentTurn = {
-  kind: "prompt" | "guess" | "caption" | "draw" | "memory" | "remix" | "blind-draw";
-  round: number;
-  playerId?: string;
-  instruction?: string;
-  prompt?: string;
-  clue?: string;
-  previousText?: string;
-  previousImage?: string;
-  rule?: string;
-  duoBeat?: string;
-  deadlineAt?: number;
-  revealUntil?: number;
-  sourceEntryId?: string | null;
-  sourceExpired?: boolean;
-  canAddClue?: boolean;
-};
-type Room = {
-  code: string;
-  phase: "lobby" | "playing" | "gallery" | "finished";
-  version: number;
-  hostPlayerId?: string;
-  activePlayerId?: string;
-  turnIndex?: number;
-  totalTurns?: number;
-  turnNumber?: number;
-  presenceVersion?: number;
-  serverNow?: number;
-  expiresAt?: number;
-  settings: Settings;
-  players: Player[];
-  currentTurn?: CurrentTurn | null;
-  gallery?: GalleryEntry[];
-};
-type Session = {
-  room: Room;
-  playerId: string;
-  playerToken: string;
-  recoveryToken?: string;
-  playerName?: string;
-};
+import type { View, ModeId, Settings, GalleryEntry, CurrentTurn, Room, Session } from "@/lib/client/game-types";
+import { createLocalRoom, advanceLocalRoom, addLocalClue } from "@/lib/client/local-game";
 
 const MODES: Array<{
   id: ModeId;
@@ -197,24 +125,8 @@ const MODE_RECIPES: Record<ModeId, Pick<Settings, "rounds" | "timerSeconds" | "c
   "guess-evolution": { rounds: 9, timerSeconds: 60, canvasSize: "square" },
 };
 
-const DEMO_PROMPTS = [
-  "A moon taking its pet cloud for a walk",
-  "Two frogs opening a tiny bakery",
-  "A detective sandwich following crumbs",
-  "A very formal dragon at karaoke",
-  "A ghost trying to take a group photo",
-];
-
-const DEMO_REMIX_RULES = [
-  "Make it dramatic",
-  "Turn one detail into a monster",
-  "Add something suspicious",
-  "Make it unexpectedly fancy",
-];
-
 function normalizeRoom(value: unknown): Room {
-  const body = value as { room?: Room } & Room;
-  return body.room ?? body;
+  return readRoomSnapshot(value);
 }
 
 function modeById(id: ModeId) {
@@ -238,12 +150,12 @@ function viewForRoom(room: Room): View {
 
 function persistRoomSession(session: Session) {
   if (typeof window === "undefined" || session.room.code === "DEMO") return true;
-  const activeSaved = saveActiveCredentials(window.sessionStorage, session.room.code, {
+  const activeSaved = saveActiveCredentials(browserStorage("session"), session.room.code, {
     playerId: session.playerId,
     playerToken: session.playerToken,
   });
   const recoverySaved = session.recoveryToken
-    ? saveRecoverySession(window.localStorage, {
+    ? saveRecoverySession(browserStorage("local"), {
         code: session.room.code,
         playerId: session.playerId,
         recoveryToken: session.recoveryToken,
@@ -258,6 +170,7 @@ function persistRoomSession(session: Session) {
 function roomTurnSignature(room: Room) {
   const turn = room.currentTurn;
   return [
+    room.localGameId ?? "online",
     room.turnNumber ?? room.turnIndex ?? 0,
     turn?.round ?? 0,
     turn?.kind ?? "waiting",
@@ -280,6 +193,9 @@ export function GameApp() {
   const [confirmLeave, setConfirmLeave] = useState(false);
   const [copied, setCopied] = useState(false);
   const [showHow, setShowHow] = useState(false);
+  const [savedLocalRoom, setSavedLocalRoom] = useState<Room | null>(null);
+  const importInput = useRef<HTMLInputElement>(null);
+  useDialogFocus(showHow || confirmLeave, () => { setShowHow(false); setConfirmLeave(false); });
   const pollFailureCount = useRef(0);
   const sessionRef = useRef<Session | null>(null);
   const wakePollRef = useRef<(() => void) | null>(null);
@@ -293,7 +209,36 @@ export function GameApp() {
 
   useEffect(() => {
     sessionRef.current = session;
+    if (session?.room.code === "DEMO") {
+      void saveTurnDraft({ key: "pass-and-play", text: JSON.stringify(session.room), updatedAt: Date.now() })
+        .then((saved) => { if (!saved) setStorageWarning(true); });
+    }
   }, [session]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void readTurnDraft("pass-and-play").then((draft) => {
+      if (cancelled || !draft?.text) return;
+      try {
+        const saved = JSON.parse(draft.text) as Room;
+        if (saved.code === "DEMO" && saved.localGameId && saved.localState && saved.settings && Array.isArray(saved.players)) setSavedLocalRoom(saved);
+      } catch { /* Keep malformed data untouched for manual recovery. */ }
+    });
+    return () => { cancelled = true; };
+  }, [view]);
+
+  async function importStory(file?: File) {
+    if (!file) return;
+    try {
+      if (file.size > MAX_STORY_BYTES) throw new Error("Choose a story smaller than 64 MB.");
+      const archive = parseStoryArchive(await file.text());
+      const archived: Room = { code: "ARCHIVE", archiveMode: archive.mode, phase: "gallery", version: 1,
+        settings: { ...DEFAULT_SETTINGS }, players: [], gallery: archive.entries };
+      setSession({ room: archived, playerId: "archive", playerToken: "" });
+      setView("gallery"); setError("");
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not open this story."); }
+    finally { if (importInput.current) importInput.current.value = ""; }
+  }
 
   const acceptSession = useCallback((next: Session) => {
     sessionRef.current = next;
@@ -304,8 +249,8 @@ export function GameApp() {
     const saved = persistRoomSession(next);
     setStorageWarning(!saved);
     if (typeof window !== "undefined") {
-      if (next.recoveryToken) removeLegacyCredentials(window.localStorage, next.room.code);
-      setRecentRooms(listRecoverySessions(window.localStorage));
+      if (next.recoveryToken) removeLegacyCredentials(browserStorage("local"), next.room.code);
+      setRecentRooms(listRecoverySessions(browserStorage("local")));
       window.history.replaceState({}, "", `?room=${next.room.code}`);
     }
   }, []);
@@ -317,18 +262,18 @@ export function GameApp() {
     const normalizedCode = code.toUpperCase();
     setLoading(true);
     setError("");
-    const savedRecovery = readRecoverySession(window.localStorage, normalizedCode);
+    const savedRecovery = readRecoverySession(browserStorage("local"), normalizedCode);
     const recovery = override ?? (savedRecovery?.recoveryToken
       ? { playerId: savedRecovery.playerId, recoveryToken: savedRecovery.recoveryToken }
       : undefined);
     const active = override
       ? undefined
-      : readActiveCredentials(window.sessionStorage, normalizedCode)
-        ?? readLegacyCredentials(window.localStorage, normalizedCode);
+      : readActiveCredentials(browserStorage("session"), normalizedCode)
+        ?? readLegacyCredentials(browserStorage("local"), normalizedCode);
 
     if (active) {
       try {
-        const response = await fetch(`/api/rooms/${normalizedCode}`, {
+        const response = await roomFetch(apiUrl(`/api/rooms/${normalizedCode}`), {
           cache: "no-store",
           headers: roomAuthHeaders(active),
         });
@@ -351,13 +296,13 @@ export function GameApp() {
           setError("We could not reconnect yet. Your saved seat is safe — try again when the connection settles.");
           return false;
         }
-        removeActiveCredentials(window.sessionStorage, normalizedCode);
+        removeActiveCredentials(browserStorage("session"), normalizedCode);
       }
     }
 
     if (recovery) {
       try {
-        const response = await fetch(`/api/rooms/${normalizedCode}/recover`, {
+        const response = await roomFetch(apiUrl(`/api/rooms/${normalizedCode}/recover`), {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(recovery),
@@ -377,22 +322,22 @@ export function GameApp() {
         return true;
       } catch (cause) {
         if (isConfirmedInvalidAuth(cause)) {
-          const latestRecovery = readRecoverySession(window.localStorage, normalizedCode);
+          const latestRecovery = readRecoverySession(browserStorage("local"), normalizedCode);
           const recoveryWasRotatedElsewhere = Boolean(
             latestRecovery &&
             (latestRecovery.playerId !== recovery.playerId ||
               latestRecovery.recoveryToken !== recovery.recoveryToken),
           );
           if (override || recoveryWasRotatedElsewhere) {
-            setRecentRooms(listRecoverySessions(window.localStorage));
+            setRecentRooms(listRecoverySessions(browserStorage("local")));
             setError(
               recoveryWasRotatedElsewhere
                 ? "Another tab refreshed this seat first. Its newer recovery key was kept safe — press Resume once more."
                 : "That private recovery link has expired. Any newer seat saved on this device was kept safe.",
             );
           } else {
-            removeRoomSession(window.localStorage, window.sessionStorage, normalizedCode);
-            setRecentRooms(listRecoverySessions(window.localStorage));
+            removeRoomSession(browserStorage("local"), browserStorage("session"), normalizedCode);
+            setRecentRooms(listRecoverySessions(browserStorage("local")));
             setError("That saved seat is no longer valid. You can still join an open seat with the room code.");
           }
         } else {
@@ -411,9 +356,9 @@ export function GameApp() {
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const code = params.get("room")?.toUpperCase();
-    pruneRecoverySessions(window.localStorage, 45 * 24 * 60 * 60 * 1000);
+    pruneRecoverySessions(browserStorage("local"), 45 * 24 * 60 * 60 * 1000);
     const refreshRecentRooms = window.setTimeout(() => {
-      setRecentRooms(listRecoverySessions(window.localStorage));
+      setRecentRooms(listRecoverySessions(browserStorage("local")));
     }, 0);
     if (!code) return () => window.clearTimeout(refreshRecentRooms);
     let cancelled = false;
@@ -430,7 +375,7 @@ export function GameApp() {
           : undefined;
         const resumed = await resumeRoom(code, override);
         if (cancelled || resumed) return;
-        const hasSavedRecovery = Boolean(readRecoverySession(window.localStorage, code));
+        const hasSavedRecovery = Boolean(readRecoverySession(browserStorage("local"), code));
         if (!hasSavedRecovery) {
           setJoinCode(code);
           setView("join");
@@ -512,13 +457,14 @@ export function GameApp() {
           sinceVersion: String(current.room.version),
           sincePresenceVersion: String(current.room.presenceVersion ?? 0),
         });
-        const response = await fetch(`/api/rooms/${code}?${query}`, {
+        const response = await roomFetch(apiUrl(`/api/rooms/${code}?${query}`), {
           cache: "no-store",
           headers: roomAuthHeaders(current),
           signal: requestController.signal,
         });
         if (response.status !== 304) {
           const body = await readRoomJson(response);
+          if (stopped || requestController.signal.aborted) return;
           applyRoomSnapshot(normalizeRoom(body));
         }
         pollFailureCount.current = 0;
@@ -529,6 +475,7 @@ export function GameApp() {
         if (isConfirmedInvalidAuth(cause)) {
           const recovered = await resumeRoom(code);
           if (!recovered) setReconnecting(true);
+          schedule(recovered ? 900 : pollingDelay(++pollFailureCount.current));
           return;
         }
         pollFailureCount.current += 1;
@@ -566,7 +513,7 @@ export function GameApp() {
     setLoading(true);
     setError("");
     try {
-      const response = await fetch("/api/rooms", {
+      const response = await roomFetch(apiUrl("/api/rooms"), {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ playerName: playerName.trim(), settings }),
@@ -600,7 +547,7 @@ export function GameApp() {
     setLoading(true);
     setError("");
     try {
-      const response = await fetch(`/api/rooms/${code}/join`, {
+      const response = await roomFetch(apiUrl(`/api/rooms/${code}/join`), {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ playerName: playerName.trim() }),
@@ -622,29 +569,7 @@ export function GameApp() {
   }
 
   function startPassAndPlay() {
-    const hostName = playerName.trim() || "Doodler One";
-    const demoRoom: Room = {
-      code: "DEMO",
-      phase: "playing",
-      version: 1,
-      hostPlayerId: "demo-a",
-      activePlayerId: "demo-a",
-      turnIndex: 0,
-      totalTurns: settings.rounds,
-      settings,
-      players: [
-        { id: "demo-a", name: hostName, isHost: true },
-        { id: "demo-b", name: "Doodler Two" },
-      ],
-      currentTurn: {
-        kind: "prompt",
-        round: 1,
-        playerId: "demo-a",
-        instruction: "Plant the first strange little idea.",
-        prompt: settings.randomPrompts ? DEMO_PROMPTS[0] : undefined,
-      },
-      gallery: [],
-    };
+    const demoRoom = createLocalRoom(settings, playerName.trim() || "Doodler One");
     setSession({ room: demoRoom, playerId: "demo-a", playerToken: "local" });
     setView("game");
     setError("");
@@ -660,7 +585,7 @@ export function GameApp() {
     const leaseKey = `ink-and-echo:action:${current.room.code}`;
     const owner = tabIdRef.current || (tabIdRef.current = crypto.randomUUID());
     try {
-      const existing = JSON.parse(window.localStorage.getItem(leaseKey) || "null") as {
+      const existing = JSON.parse(browserStorage("local").getItem(leaseKey) || "null") as {
         owner?: string;
         expiresAt?: number;
       } | null;
@@ -669,14 +594,14 @@ export function GameApp() {
         wakePollRef.current?.();
         return false;
       }
-      window.localStorage.setItem(leaseKey, JSON.stringify({ owner, expiresAt: Date.now() + 15_000 }));
+      browserStorage("local").setItem(leaseKey, JSON.stringify({ owner, expiresAt: Date.now() + 15_000 }));
     } catch {
       // Version checks on the server still prevent duplicate commits when storage is unavailable.
     }
     setLoading(true);
     setError("");
     try {
-      const response = await fetch(`/api/rooms/${current.room.code}/actions`, {
+      const response = await roomFetch(apiUrl(`/api/rooms/${current.room.code}/actions`), {
         method: "POST",
         headers: roomAuthHeaders(current, true),
         body: JSON.stringify({
@@ -704,8 +629,8 @@ export function GameApp() {
     } finally {
       setLoading(false);
       try {
-        const lease = JSON.parse(window.localStorage.getItem(leaseKey) || "null") as { owner?: string } | null;
-        if (lease?.owner === owner) window.localStorage.removeItem(leaseKey);
+        const lease = JSON.parse(browserStorage("local").getItem(leaseKey) || "null") as { owner?: string } | null;
+        if (lease?.owner === owner) browserStorage("local").removeItem(leaseKey);
       } catch {
         // Lease expiry handles cleanup when storage reads fail.
       }
@@ -716,6 +641,7 @@ export function GameApp() {
     setSession(null);
     sessionRef.current = null;
     setView("landing");
+    setReconnecting(false);
     setError("");
     window.history.replaceState({}, "", window.location.pathname);
   }
@@ -730,7 +656,7 @@ export function GameApp() {
       setLoading(true);
       setError("");
       try {
-        const response = await fetch(`/api/rooms/${current.room.code}/leave`, {
+        const response = await roomFetch(apiUrl(`/api/rooms/${current.room.code}/leave`), {
           method: "POST",
           headers: roomAuthHeaders(current),
         });
@@ -741,8 +667,8 @@ export function GameApp() {
         setLoading(false);
         return;
       }
-      removeRoomSession(window.localStorage, window.sessionStorage, current.room.code);
-      setRecentRooms(listRecoverySessions(window.localStorage));
+      removeRoomSession(browserStorage("local"), browserStorage("session"), current.room.code);
+      setRecentRooms(listRecoverySessions(browserStorage("local")));
       setLoading(false);
     }
     setConfirmLeave(false);
@@ -758,13 +684,13 @@ export function GameApp() {
     setLoading(true);
     setError("");
     try {
-      const response = await fetch(`/api/rooms/${current.room.code}`, {
+      const response = await roomFetch(apiUrl(`/api/rooms/${current.room.code}`), {
         method: "DELETE",
         headers: roomAuthHeaders(current),
       });
       await readRoomJson(response);
-      removeRoomSession(window.localStorage, window.sessionStorage, current.room.code);
-      setRecentRooms(listRecoverySessions(window.localStorage));
+      removeRoomSession(browserStorage("local"), browserStorage("session"), current.room.code);
+      setRecentRooms(listRecoverySessions(browserStorage("local")));
       returnHome();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "The room could not be deleted yet.");
@@ -775,13 +701,14 @@ export function GameApp() {
 
   return (
     <main className="app-shell">
+      <input ref={importInput} type="file" accept="application/json,.json" hidden aria-label="Import story file" onChange={(event) => void importStory(event.target.files?.[0])} />
       <div className="ambient ambient-one" aria-hidden="true" />
       <div className="ambient ambient-two" aria-hidden="true" />
       <Header
         roomCode={room?.code}
         onHome={returnHome}
         onHow={() => setShowHow(true)}
-        onLeave={room ? () => setConfirmLeave(true) : undefined}
+        onLeave={room && room.code !== "ARCHIVE" ? () => setConfirmLeave(true) : undefined}
       />
 
       {reconnecting && (
@@ -808,6 +735,11 @@ export function GameApp() {
         <Landing
           playerName={playerName}
           setPlayerName={setPlayerName}
+          onImport={() => importInput.current?.click()}
+          onResumeLocal={savedLocalRoom ? () => {
+            setSession({ room: savedLocalRoom, playerId: "demo-a", playerToken: "local" });
+            setView(viewForRoom(savedLocalRoom));
+          } : undefined}
           onCreate={() => setView("create")}
           onJoin={() => setView("join")}
           onDemo={startPassAndPlay}
@@ -823,6 +755,9 @@ export function GameApp() {
 
       {view === "create" && (
         <CreateRoom
+          playerName={playerName}
+          setPlayerName={setPlayerName}
+          onDemo={startPassAndPlay}
           settings={settings}
           setSettings={setSettings}
           selectedMode={selectedMode}
@@ -850,14 +785,22 @@ export function GameApp() {
           me={session.playerId}
           copied={copied}
           onCopy={async () => {
-            await navigator.clipboard.writeText(makeInviteUrl(room.code));
-            setCopied(true);
-            window.setTimeout(() => setCopied(false), 1800);
+            try {
+              await navigator.clipboard.writeText(makeInviteUrl(room.code));
+              setCopied(true);
+              window.setTimeout(() => setCopied(false), 1800);
+            } catch {
+              setError("Copy is blocked in this browser. Share the room code shown here instead.");
+            }
           }}
           onCopyResume={session.recoveryToken ? async () => {
-            await navigator.clipboard.writeText(makeResumeUrl(room.code, session.playerId, session.recoveryToken!));
-            setCopied(true);
-            window.setTimeout(() => setCopied(false), 1800);
+            try {
+              await navigator.clipboard.writeText(makeResumeUrl(room.code, session.playerId, session.recoveryToken!));
+              setCopied(true);
+              window.setTimeout(() => setCopied(false), 1800);
+            } catch {
+              setError("Copy is blocked in this browser. Allow clipboard access to copy your private recovery link.");
+            }
           } : undefined}
           onStart={startRemoteGame}
           loading={loading}
@@ -928,6 +871,8 @@ function Landing({
   recentRooms,
   loading,
   onResume,
+  onImport,
+  onResumeLocal,
 }: {
   playerName: string;
   setPlayerName: (value: string) => void;
@@ -938,6 +883,8 @@ function Landing({
   recentRooms: StoredRoomSession[];
   loading: boolean;
   onResume: (code: string) => void;
+  onImport: () => void;
+  onResumeLocal?: () => void;
 }) {
   return (
     <>
@@ -962,6 +909,10 @@ function Landing({
           <div className="hero-actions">
             <button className="primary-button big" onClick={onCreate}>Make a room <span>→</span></button>
             <button className="secondary-button big" onClick={onJoin}>Join a friend</button>
+          </div>
+          <div className="archive-actions">
+            <button className="quiet-button" onClick={onImport}>Open saved story</button>
+            {onResumeLocal && <button className="quiet-button" onClick={onResumeLocal}>Resume pass & play</button>}
           </div>
            <button className="demo-link" onClick={onDemo}><span>▶</span> Try pass & play on this device</button>
           {recentRooms.length > 0 && (
@@ -1053,6 +1004,7 @@ function HeroChain() {
 }
 
 function CreateRoom({
+  playerName, setPlayerName, onDemo,
   settings,
   setSettings,
   selectedMode,
@@ -1060,6 +1012,9 @@ function CreateRoom({
   onBack,
   onCreate,
 }: {
+  playerName: string;
+  setPlayerName: (name: string) => void;
+  onDemo: () => void;
   settings: Settings;
   setSettings: React.Dispatch<React.SetStateAction<Settings>>;
   selectedMode: (typeof MODES)[number];
@@ -1083,6 +1038,7 @@ function CreateRoom({
 
       <div className="setup-layout">
         <div className="settings-card">
+          <label className="setup-name">Your doodling name<input value={playerName} maxLength={24} onChange={(event) => setPlayerName(event.target.value)} placeholder="e.g. Captain Scribble" /></label>
           <div className="setting-block">
             <div className="setting-title"><span>01</span><div><strong>Choose a mode</strong><small>Each one changes the rhythm of your turns.</small></div></div>
             <div className="mode-picker">
@@ -1090,6 +1046,7 @@ function CreateRoom({
                 <button
                   key={mode.id}
                   className={settings.mode === mode.id ? "active" : ""}
+                  aria-pressed={settings.mode === mode.id}
                   onClick={() => setSettings((current) => withModeRecipe(current, mode.id))}
                 >
                   <span>{mode.icon}</span>{mode.name}
@@ -1116,10 +1073,11 @@ function CreateRoom({
             <div className="setting-block compact">
               <div className="setting-title"><span>03</span><div><strong>Turn timer</strong><small>A little pressure, lovingly.</small></div></div>
               <div className="segmented">
-                {[20, 30, 60, 90, 120].map((seconds) => (
+                {(settings.mode === "speed-chaos" ? [10, 15, 20, 25] : [20, 30, 60, 90, 120]).map((seconds) => (
                   <button
                     key={seconds}
                     className={settings.timerSeconds === seconds ? "active" : ""}
+                    aria-pressed={settings.timerSeconds === seconds}
                     onClick={() => setSettings((current) => ({ ...current, timerSeconds: seconds }))}
                   >{seconds < 60 ? `${seconds}s` : `${seconds / 60}m`}</button>
                 ))}
@@ -1132,7 +1090,7 @@ function CreateRoom({
               <div className="setting-title"><span>04</span><div><strong>Canvas</strong><small>Pick a shape for the story.</small></div></div>
               <div className="canvas-options">
                 {(["square", "classic", "wide"] as const).map((size) => (
-                  <button key={size} className={settings.canvasSize === size ? "active" : ""} onClick={() => setSettings((c) => ({ ...c, canvasSize: size }))}>
+                  <button key={size} aria-pressed={settings.canvasSize === size} className={settings.canvasSize === size ? "active" : ""} onClick={() => setSettings((c) => ({ ...c, canvasSize: size }))}>
                     <i className={`canvas-shape ${size}`} />{size === "classic" ? "4:3" : size}
                   </button>
                 ))}
@@ -1161,7 +1119,8 @@ function CreateRoom({
             <div><dt>Canvas</dt><dd>{settings.canvasSize}</dd></div>
           </dl>
           <button className="primary-button full" onClick={onCreate} disabled={loading}>{loading ? "Folding the invite…" : "Create the room →"}</button>
-          <small>Your friend joins with a private six-character code.</small>
+          <button className="secondary-button full" onClick={onDemo}>Play these settings on this device</button>
+          <small>Your friend joins with a six-character code. Keep your recovery link private.</small>
         </aside>
       </div>
     </section>
@@ -1322,17 +1281,21 @@ function Timer({ seconds, deadlineAt, serverNow, onExpire }: { seconds: number; 
   const leftRef = useRef(seconds);
   const firedRef = useRef(false);
   const clockOffsetRef = useRef(0);
+  const onExpireRef = useRef(onExpire);
+  const localDeadlineRef = useRef(0);
+  useEffect(() => { onExpireRef.current = onExpire; });
   useEffect(() => {
+    if (!localDeadlineRef.current) localDeadlineRef.current = Date.now() + seconds * 1000;
     clockOffsetRef.current = serverNow ? serverNow - Date.now() : 0;
     const update = () => {
       const next = deadlineAt
         ? Math.max(0, Math.ceil((deadlineAt - (Date.now() + clockOffsetRef.current)) / 1000))
-        : Math.max(0, leftRef.current - 1);
+        : Math.max(0, Math.ceil((localDeadlineRef.current - Date.now()) / 1000));
       leftRef.current = next;
       setLeft(next);
       if (next === 0 && !firedRef.current) {
         firedRef.current = true;
-        onExpire?.();
+        onExpireRef.current?.();
       }
     };
     const initialSync = window.setTimeout(() => {
@@ -1343,7 +1306,7 @@ function Timer({ seconds, deadlineAt, serverNow, onExpire }: { seconds: number; 
       window.clearTimeout(initialSync);
       window.clearInterval(timer);
     };
-  }, [deadlineAt, onExpire, serverNow]);
+  }, [deadlineAt, serverNow, seconds]);
   const minutes = Math.floor(left / 60);
   const remaining = String(left % 60).padStart(2, "0");
   return <div className={`turn-timer ${left <= 10 ? "urgent" : ""}`}><small>Gentle panic</small><strong>{minutes}:{remaining}</strong></div>;
@@ -1408,7 +1371,7 @@ function TurnWorkspace({ room, playerId, loading, timerExpired, onAction, onLoca
     const restore = async () => {
       const saved = await readTurnDraft(draftKey);
       if (cancelled) return;
-      if (saved?.text && !isDrawing) setText(saved.text);
+      if (typeof saved?.text === "string" && !isDrawing) setText(saved.text);
       if (saved?.imageData && isDrawing && !memoryVisible && canvasRef.current) {
         try {
           const parsed = JSON.parse(saved.imageData) as unknown;
@@ -1436,7 +1399,9 @@ function TurnWorkspace({ room, playerId, loading, timerExpired, onAction, onLoca
   useEffect(() => {
     if (!draftReady || isDrawing) return;
     const timer = window.setTimeout(() => {
-      void saveTurnDraft({ key: draftKey, text, updatedAt: Date.now() });
+      void saveTurnDraft({ key: draftKey, text, updatedAt: Date.now() }).then((saved) => {
+        if (!saved) setDraftNote("This browser could not save your words locally. Keep this tab open.");
+      });
     }, 350);
     return () => window.clearTimeout(timer);
   }, [draftKey, draftReady, isDrawing, text]);
@@ -1465,54 +1430,9 @@ function TurnWorkspace({ room, playerId, loading, timerExpired, onAction, onLoca
   }, [draftKey, draftReady]);
 
   const advanceDemo = useCallback((entry: GalleryEntry) => {
-    const gallery = [...(room.gallery ?? []), entry];
-    const nextIndex = (room.turnIndex ?? 0) + 1;
-    if (nextIndex >= room.settings.rounds) {
-      onLocalRoom({ ...room, phase: "gallery", gallery, turnIndex: nextIndex, currentTurn: null });
-      onGallery();
-      return;
-    }
-    const nextPlayerId = room.activePlayerId === "demo-a" ? "demo-b" : "demo-a";
-    const lastDrawing = [...gallery].reverse().find((item) => item.imageData);
-    const lastText = [...gallery].reverse().find((item) => item.text);
-    const mode = room.settings.mode;
-    let kind: CurrentTurn["kind"] = nextIndex % 2 === 1 ? "draw" : "guess";
-    if (mode === "memory-drift") kind = nextIndex === 1 ? "draw" : "memory";
-    if (mode === "blind-prompt") kind = nextIndex % 2 === 1 ? "blind-draw" : "prompt";
-    if (mode === "remix-mode") kind = nextIndex === 1 ? "draw" : "remix";
-    if (mode === "story-canvas") kind = nextIndex % 2 === 1 ? "draw" : "caption";
-    const rule = kind === "remix" ? DEMO_REMIX_RULES[(nextIndex - 2) % DEMO_REMIX_RULES.length] : undefined;
-    const instruction = kind === "draw"
-      ? mode === "story-canvas" ? "Draw the next panel from the last caption." : "Draw only what the last words suggest."
-      : kind === "guess"
-        ? "Name the mysterious thing you see."
-        : kind === "memory"
-          ? "Look closely, then recreate this drawing from memory."
-          : kind === "blind-draw"
-            ? "Draw from the clue without seeing the full prompt."
-            : kind === "remix"
-              ? "Keep the old idea and obey the new remix rule."
-              : kind === "caption"
-                ? "Caption this as the next beat of your tiny story."
-                : "Plant the next strange little idea.";
-    onLocalRoom({
-      ...room,
-      version: room.version + 1,
-      activePlayerId: nextPlayerId,
-      turnIndex: nextIndex,
-      gallery,
-      currentTurn: {
-        kind,
-        round: nextIndex + 1,
-        playerId: nextPlayerId,
-        previousText: kind === "blind-draw" ? undefined : lastText?.text,
-        previousImage: lastDrawing?.imageData,
-        prompt: kind === "draw" ? lastText?.text : kind === "prompt" && room.settings.randomPrompts ? DEMO_PROMPTS[nextIndex % DEMO_PROMPTS.length] : undefined,
-        clue: kind === "blind-draw" ? "It has a very recognizable silhouette." : undefined,
-        rule,
-        instruction,
-      },
-    });
+    const next = advanceLocalRoom(room, entry);
+    onLocalRoom(next);
+    if (next.phase === "gallery") onGallery();
   }, [onGallery, onLocalRoom, room]);
 
   async function submitText() {
@@ -1639,7 +1559,7 @@ function TurnWorkspace({ room, playerId, loading, timerExpired, onAction, onLoca
             latestDrawingRef.current = dataUrl;
             saveDrawingDraftSoon();
           }}
-          disabled={loading || preparingDrawing}
+          disabled={loading || preparingDrawing || !draftReady}
           downloadFileName={`ink-and-echo-round-${turn.round}.png`}
           ariaLabel={`Drawing canvas for round ${turn.round}`}
         />
@@ -1649,13 +1569,8 @@ function TurnWorkspace({ room, playerId, loading, timerExpired, onAction, onLoca
           {turn.kind === "blind-draw" && (
             <button className="secondary-button" disabled={loading} onClick={() => {
               if (room.code === "DEMO") {
-                onLocalRoom({
-                  ...room,
-                  version: room.version + 1,
-                  currentTurn: turn.clue?.includes("silhouette")
-                    ? { ...turn, clue: "Its mood is more dramatic than practical." }
-                    : { ...turn, clue: "One small detail is doing most of the storytelling." },
-                });
+                try { onLocalRoom(addLocalClue(room)); }
+                catch (cause) { setDraftNote(cause instanceof Error ? cause.message : "No more clues are available."); }
                 return;
               }
               void onAction("add_clue", {});
@@ -1711,12 +1626,7 @@ function Gallery({ room, onAgain, onDelete, loading }: { room: Room; onAgain: ()
     link.click();
   }
   function exportStory() {
-    const blob = new Blob([JSON.stringify({ title: "Ink & Echo", mode: mode.name, entries }, null, 2)], { type: "application/json" });
-    const link = document.createElement("a");
-    link.href = URL.createObjectURL(blob);
-    link.download = `ink-and-echo-${room.code.toLowerCase()}.json`;
-    link.click();
-    URL.revokeObjectURL(link.href);
+    downloadJson(storyArchive(room.archiveMode ?? mode.name, entries), `ink-and-echo-${room.code.toLowerCase()}.json`);
   }
   return (
     <section className="gallery-page page-width">

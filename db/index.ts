@@ -5,7 +5,7 @@ import * as schema from "./schema";
 export function getDb() {
   if (!env.DB) {
     throw new Error(
-      "Cloudflare D1 binding `DB` is unavailable. Set the `d1` field in .openai/hosting.json to `DB` or let your control plane inject the real binding values before using the database."
+      "Cloudflare D1 binding `DB` is unavailable. Configure the app's D1 binding in the Worker configuration before using the database."
     );
   }
 
@@ -15,7 +15,7 @@ export function getDb() {
 export function getD1(): D1Database {
   if (!env.DB) {
     throw new Error(
-      "Cloudflare D1 binding `DB` is unavailable. Set the `d1` field in .openai/hosting.json to `DB` before using room persistence.",
+      "Cloudflare D1 binding `DB` is unavailable. Configure the app's D1 binding in the Worker configuration before using room persistence.",
     );
   }
 

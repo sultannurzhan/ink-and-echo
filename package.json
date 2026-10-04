@@ -6,36 +6,49 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "dev": "vinext dev",
+    "dev": "vinext dev --hostname 127.0.0.1",
     "build": "vinext build",
-    "start": "vinext start",
+    "start": "vinext start --hostname 127.0.0.1",
     "test": "npm run build && node --experimental-strip-types --test tests/*.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
-    "db:generate": "drizzle-kit generate"
+    "db:generate": "drizzle-kit generate",
+    "build:pages": "vite build --config vite.pages.config.ts",
+    "dev:pages": "vite --config vite.pages.config.ts",
+    "preview:pages": "vite preview --config vite.pages.config.ts",
+    "dev:api": "wrangler dev --config wrangler.jsonc --local",
+    "build:api": "wrangler deploy --config wrangler.jsonc --dry-run --outdir dist-api",
+    "deploy:api": "node scripts/prepare-backend.mjs && wrangler deploy --config work/wrangler.production.json",
+    "typecheck": "tsc --noEmit",
+    "test:unit": "node --experimental-strip-types --test tests/*.test.mjs",
+    "test:api": "node --test tests/api.integration.mjs"
   },
   "dependencies": {
     "drizzle-orm": "0.45.2",
-    "next": "16.2.6",
-    "react": "19.2.6",
-    "react-dom": "19.2.6"
+    "next": "16.3.8",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
   },
   "devDependencies": {
-    "@cloudflare/vite-plugin": "1.37.1",
+    "@cloudflare/vite-plugin": "1.62.5",
     "@tailwindcss/postcss": "4.2.1",
     "@types/node": "22.19.19",
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "6.0.2",
-    "@vitejs/plugin-rsc": "0.5.26",
+    "@vitejs/plugin-rsc": "0.5.34",
     "drizzle-kit": "0.31.10",
     "eslint": "9.39.4",
-    "eslint-config-next": "16.2.6",
-    "react-server-dom-webpack": "19.2.6",
+    "eslint-config-next": "16.3.8",
+    "fake-indexeddb": "6.2.5",
+    "react-server-dom-webpack": "19.3.0",
     "tailwindcss": "4.2.1",
     "typescript": "5.9.3",
-    "vinext": "0.0.50",
-    "vite": "8.0.13",
-    "wrangler": "4.92.0"
+    "vinext": "1.0.1",
+    "vite": "8.3.2",
+    "wrangler": "4.147.0"
   },
-  "type": "module"
+  "type": "module",
+  "overrides": {
+    "fflate": "0.7.5"
+  }
 }
