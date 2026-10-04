@@ -4,6 +4,8 @@ A cozy drawing game for exactly two people: trade prompts, doodles, guesses and 
 
 Source: [sultannurzhan/ink-and-echo](https://github.com/sultannurzhan/ink-and-echo).
 
+Live app: **[Ink & Echo on GitHub Pages](https://sultannurzhan.github.io/ink-and-echo/)**. Multiplayer API: `https://ink-and-echo-api.takibaysultan.workers.dev`. Both were deployed and exercised on 2026-10-05 (Korea time); the backend account remains on Workers Free.
+
 ## Architecture
 
 - **GitHub Pages** serves the static React frontend, built with Vite at the repository base path `/ink-and-echo/`.

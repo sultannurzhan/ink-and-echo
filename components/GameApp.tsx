@@ -197,6 +197,10 @@ export function GameApp() {
   const selectedMode = modeById(settings.mode);
 
   useEffect(() => {
+    window.scrollTo(0, 0);
+  }, [view]);
+
+  useEffect(() => {
     sessionRef.current = session;
     if (session?.room.code === "DEMO") {
       void saveTurnDraft({ key: "pass-and-play", text: JSON.stringify(session.room), updatedAt: Date.now() })

@@ -4,7 +4,9 @@
 
 The old owner-controlled deployment is **https://ink-and-echo-two.takibaysultan.chatgpt.site**, Sites project `appgprj_6a53f9c75e7c8191950ceb8fc5f70859`, saved version 3. Identity was checked through the connector. Its original source and identity remain in Git; the pre-audit commit is `344dfaa`.
 
-The replacement targets the existing personal repository `sultannurzhan/ink-and-echo` and GitHub Pages, with a separate Worker/D1 for multiplayer. The audit log records actual publication/retirement status; an expected URL is not proof of deployment.
+The verified replacement is **https://sultannurzhan.github.io/ink-and-echo/**, from the existing personal repository `sultannurzhan/ink-and-echo`, with the separate app-owned Worker/D1 at `https://ink-and-echo-api.takibaysultan.workers.dev`. Public gameplay, persistence, query-route refresh and original-format story import were exercised successfully.
+
+**Old-site retirement is pending.** Its status remains active. The owner still needs to export any stories/drafts worth retaining, verify those files on the replacement, then use a supported reversible unpublish/deactivate route for the exact old project. No assets or accounts were deleted.
 
 ## Save existing data first
 
