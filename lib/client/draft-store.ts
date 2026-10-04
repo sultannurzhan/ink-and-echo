@@ -1,3 +1,5 @@
+import type { Room } from "./game-types.ts";
+
 export type TurnDraft = {
   key: string;
   text?: string;
@@ -92,4 +94,17 @@ export async function deleteTurnDraft(key: string) {
 
 export function turnDraftKey(roomCode: string, playerId: string, turnSignature: string) {
   return `${roomCode}:${playerId}:${turnSignature}`;
+}
+
+export function roomTurnSignature(room: Room) {
+  const turn = room.currentTurn;
+  return [
+    // Keep existing online keys stable; isolate only new pass-and-play games.
+    ...(room.localGameId ? [room.localGameId] : []),
+    room.turnNumber ?? room.turnIndex ?? 0,
+    turn?.round ?? 0,
+    turn?.kind ?? "waiting",
+    turn?.playerId ?? room.activePlayerId ?? "none",
+    turn?.sourceEntryId ?? "seed",
+  ].join(":");
 }

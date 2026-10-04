@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { IDBFactory, IDBObjectStore } from 'fake-indexeddb';
-import { saveTurnDraft, readTurnDraft, deleteTurnDraft } from '../lib/client/draft-store.ts';
+import { saveTurnDraft, readTurnDraft, deleteTurnDraft, roomTurnSignature } from '../lib/client/draft-store.ts';
+
+test('online draft identity preserves the original release format while local games remain isolated', () => {
+  const room={turnNumber:3,currentTurn:{round:2,kind:'draw',playerId:'p',sourceEntryId:null}};
+  assert.equal(roomTurnSignature(room),'3:2:draw:p:seed');
+  assert.equal(roomTurnSignature({...room,localGameId:'new-game'}),'new-game:3:2:draw:p:seed');
+});
 
 function setup() {
   const values = new Map();

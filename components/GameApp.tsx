@@ -36,6 +36,7 @@ import {
   readTurnDraft,
   saveTurnDraft,
   turnDraftKey,
+  roomTurnSignature,
 } from "@/lib/client/draft-store";
 
 import type { View, ModeId, Settings, GalleryEntry, CurrentTurn, Room, Session } from "@/lib/client/game-types";
@@ -165,18 +166,6 @@ function persistRoomSession(session: Session) {
       })
     : true;
   return activeSaved && recoverySaved;
-}
-
-function roomTurnSignature(room: Room) {
-  const turn = room.currentTurn;
-  return [
-    room.localGameId ?? "online",
-    room.turnNumber ?? room.turnIndex ?? 0,
-    turn?.round ?? 0,
-    turn?.kind ?? "waiting",
-    turn?.playerId ?? room.activePlayerId ?? "none",
-    turn?.sourceEntryId ?? "seed",
-  ].join(":");
 }
 
 export function GameApp() {
